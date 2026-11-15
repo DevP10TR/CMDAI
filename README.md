@@ -17,7 +17,7 @@
 ## 🌟 About
 
 **CMDAI** is a standalone Pitch-Black terminal AI runtime, Ollama/OpenAI-compatible model server, Hugging Face GGUF manager, and **CMDAI-CODE** orchestrator running directly inside your Windows console (Windows Terminal & PowerShell). Built for privacy, speed, and full local autonomy:
-- **Local-First Runtime & Server**: Native support for quantized `.gguf` models via `llama.cpp` with Vulkan / CPU acceleration, plus a built-in multi-threaded HTTP server exposing Ollama (`/api/*`) and OpenAI (`/v1/*`) endpoints (`cmdai serve` / `/server`).
+- **Local-First Runtime & Server**: Native support for quantized `.gguf` models via `llama.cpp` with Vulkan / CPU acceleration, plus a built-in multi-threaded HTTP server exposing Ollama (`/api/*`) and OpenAI (`/v1/*`) endpoints (`cmdai serve` / `/server`). Works best with **[LocalLLMAPI](https://github.com/DevP10TR/LocalLLMAPI)** for dedicated Vulkan/CUDA/CPU multi-slot local serving.
 - **CMDAI-CODE Orchestrator**: Persistent TUI bridge (`<tool:cmdai_code>` / `/code`) that opens and controls external [CMDAI-CODE](https://github.com/DevP10TR/CMDAI-CODE) sessions per workspace — delegating rich natural-language engineering tasks, handling approval/clarification prompts autonomously, and syncing live progress.
 - **Multi-Provider Cloud & MCP**: Seamless integration with local GGUF, Ollama, LM Studio, vLLM, OpenRouter, Anthropic, OpenAI, and Google Gemini, alongside Model Context Protocol (`MCP`) servers and cross-session global memory (`~/.cmdai/memory.md`).
 - **Modern Terminal UI (TUI)**: Minimalist Pitch Black interface built on Textual — featuring a live TODO preview bar above the input, streaming thinking blocks, session tabs, and an interactive Hugging Face GGUF installer.
