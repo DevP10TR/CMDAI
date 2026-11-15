@@ -1,0 +1,2792 @@
+from __future__ import annotations
+
+import difflib
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
+
+from rich.markdown import Markdown
+from rich.text import Text
+from textual import events, on
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
+from textual.widgets import Button, Static, TextArea
+
+from ...agent.render import (
+    render_command_output,
+    render_edit_diff_opencode,
+    render_edit_diff_side_by_side,
+    render_tool_header,
+)
+from ...core.capabilities import clean_model_name
+
+from .helpers import get_lexer_for_path, is_api_error_message, copy_text_to_clipboard, subprocess_run_copy
+
+class _ActionStatic(Static):
+    """Static control that never starts a Textual selection on click."""
+    allow_select = False
+
+
+class UserMessageCard(Vertical):
+    """User message card with in-card label and prompt text (Swift style). Click opens copy/revert/delete."""
+
+    DEFAULT_CSS = """
+    UserMessageCard {
+        width: 100%;
+        height: auto;
+    }
+    UserMessageCard:hover {
+        border: round #388bfd;
+        background: #161b22;
+    }
+    """
+
+    def __init__(self, prompt: str = "", turn_id: int = -1, label: str = "user · actions", time_str: str = "", **kwargs):
+        classes = kwargs.pop("classes", "")
+        classes = f"user-card {classes}".strip()
+        super().__init__(classes=classes, **kwargs)
+        self.prompt = prompt
+        self.turn_id = turn_id
+        self.time_str = time_str or time.strftime("%H:%M")
+        if "·" in label:
+            p1, p2 = label.split("·", 1)
+            hdr = f"[bold #58a6ff]{p1.strip()}[/] [dim #6e7681]· {p2.strip()}[/]"
+        else:
+            hdr = f"[bold #58a6ff]{label.strip()}[/]"
+        self._header = _ActionStatic(hdr, classes="card-label")
+        self._body = Static(Text(prompt, style="white"), classes="card-body")
+
+    def compose(self):
+        yield self._header
+        yield self._body
+
+    def update_content(self, text: str) -> None:
+        self.prompt = text
+        self._body.update(Text(text, style="white"))
+
+    def set_prompt(self, prompt: str) -> None:
+        self.update_content(prompt)
+
+    def on_click(self, event: events.Click) -> None:
+        try:
+            if self.turn_id < 0:
+                return
+            app = getattr(self, "app", None)
+            if app and hasattr(app, "show_user_actions"):
+                app.show_user_actions(self.turn_id)
+        except Exception:
+            pass
+
+
+class LoadingBlock(Vertical):
+    """Model loading block with ⌬ / ✻ glyph and braille animation before thinking starts."""
+
+    DEFAULT_CSS = """
+    LoadingBlock {
+        width: 100%;
+        height: auto;
+        margin: 0;
+    }
+    """
+
+    SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, message: str = "Loading model…", **kwargs):
+        super().__init__(classes="loading-block", **kwargs)
+        self.message = message
+        self.start_time = time.time()
+        self.elapsed: float = 0.0
+        self.is_finished: bool = False
+        self._timer = None
+        self.header_widget = Static("", classes="loading-header")
+
+    def compose(self):
+        yield self.header_widget
+
+    def on_mount(self) -> None:
+        self.update_header(live=True)
+        self._timer = self.set_interval(0.08, self.tick)
+
+    def tick(self) -> None:
+        if not self.is_finished:
+            self.elapsed = time.time() - self.start_time
+            self.update_header(live=True)
+
+    def finish(self, elapsed: Optional[float] = None) -> None:
+        self.is_finished = True
+        if self._timer:
+            self._timer.stop()
+            self._timer = None
+        if elapsed is not None and elapsed > 0:
+            self.elapsed = elapsed
+        else:
+            self.elapsed = time.time() - self.start_time
+        self.update_header(live=False)
+
+    def update_header(self, live: bool = False) -> None:
+        t = Text()
+        if live:
+            glyph = ["⌬", "✻"][int(self.elapsed / 0.35) % 2]
+            t.append(f"{glyph}  ", style="bold #58a6ff")
+            t.append(self.message, style="#8b949e")
+            t.append(f"  {self.elapsed:.1f}s", style="dim #8b949e")
+        else:
+            t.append("⌬  ", style="#8b949e")
+            t.append(f"Loaded model in {self.elapsed:.1f}s", style="#8b949e")
+        self.header_widget.update(t)
+
+
+class LiveToolIndicator(Vertical):
+    """Live tool indicator while a tool is being generated/streamed.
+    Expandable on click to stream live tool content / arguments in real time."""
+
+    DEFAULT_CSS = """
+    LiveToolIndicator {
+        width: 100%;
+        height: auto;
+        margin: 0 0 1 0;
+        display: none;
+    }
+    LiveToolIndicator .live-tool-details {
+        width: 100%;
+        height: auto;
+        padding: 1 2;
+        margin-top: 1;
+        margin-bottom: 1;
+        background: #0d1117;
+        overflow-x: hidden;
+        text-wrap: nowrap;
+        text-overflow: clip;
+        display: none;
+    }
+    """
+
+    DOT_SPINNERS = ["●", "●", "○", "○"]
+
+    def __init__(self, **kwargs):
+        super().__init__(classes="live-tool-indicator", **kwargs)
+        self.tool_name: str = ""
+        self.target: str = ""
+        self.live_text: str = ""
+        self.is_expanded: bool = False
+        self._spinner_idx: int = 0
+        self.header_widget = Static("", classes="tool-header")
+        self.details_widget = Static("", classes="live-tool-details")
+        self._target_code: str = ""
+        self._displayed_code: str = ""
+        self._typewriter_timer = None
+        self.start_time: Optional[float] = None
+
+    def compose(self):
+        yield self.header_widget
+        yield self.details_widget
+
+    def _extract_code(self, raw: str) -> str:
+        code_to_show = raw.strip()
+        if code_to_show.startswith(("{", "[")) and any(k.lower() in code_to_show.lower() for k in ('"content"', '"code"', '"new"', '"new_content"', '"codecontent"', '"replacementcontent"')):
+            import re
+            m = re.search(r'"(?:CodeContent|code_content|content|code|new|new_content|replacementContent|replacement_content)"\s*:\s*"((?:\\.|[^"\\])*)"?', code_to_show)
+            if m:
+                code_to_show = m.group(1).replace('\\n', '\n').replace('\\t', '    ').replace('\\"', '"').replace('\\\\', '\\')
+        return code_to_show
+
+    def _typewriter_tick(self) -> None:
+        target_len = len(self._target_code)
+        disp_len = len(self._displayed_code)
+        if disp_len < target_len:
+            remaining = target_len - disp_len
+            if remaining > 1000:
+                step = max(30, remaining // 8)
+            elif remaining > 300:
+                step = max(12, remaining // 6)
+            elif remaining > 50:
+                step = max(4, remaining // 4)
+            else:
+                step = min(remaining, 3)
+            self._displayed_code = self._target_code[:disp_len + step]
+            if self.is_expanded:
+                self._render_details(self._displayed_code)
+        else:
+            if self._typewriter_timer is not None:
+                try:
+                    self._typewriter_timer.stop()
+                except Exception:
+                    pass
+                self._typewriter_timer = None
+
+    def update_state(self, tool_name: str, target: str = "", live_text: str = "", spinner_idx: int = 0) -> None:
+        if self.start_time is None:
+            self.start_time = time.time()
+        self.tool_name = tool_name
+        if not target and live_text:
+            import re
+            KEY_PAT = r'(?:\\?"?(?:TargetFile|target_file|targetfile|filePath|filepath|file_path|filename|file_name|dest|destination|file|path|cmd|command|commandLine|command_line|url|query)\\?"?)'
+            m = re.search(KEY_PAT + r'\s*[:=]\s*(?:\\?["\']([^"\'\r\n}>]+)(?:\\?["\'])?|([^"\'\s,}>]+))', live_text, flags=re.IGNORECASE)
+            if not m:
+                m = re.search(r'<(?:TargetFile|target_file|targetfile|filePath|filepath|file_path|filename|file_name|file|path|dest)>([^<>\r\n]+)', live_text, flags=re.IGNORECASE)
+            if m:
+                raw_tgt = m.group(1) or (m.group(2) if len(m.groups()) > 1 else "")
+                target = raw_tgt.replace('\\\\', '\\').replace('\\/', '/').strip('"\'\\')
+            elif tool_name.lower() in ("write", "edit", "read"):
+                first_line = live_text.strip().splitlines()[0].strip() if live_text.strip() else ""
+                if ("." in first_line or "/" in first_line or "\\" in first_line) and len(first_line) < 100:
+                    if not any(k in first_line for k in ("(", ")", ";", "=", "{", "}", "[", "]", ":", "<", ">", '"', "'", "import", "def", "class", "from", "//", "/*", "print", "console", "return", "function", "var", "let", "const")):
+                        target = first_line
+                elif "<!doctype html" in live_text.lower() or "<html" in live_text.lower():
+                    target = "index.html"
+
+        if target and tool_name.lower() in ("write", "edit", "read"):
+            try:
+                import os
+                app = getattr(self, "app", None)
+                wdir = getattr(app, "workdir", "") if app else ""
+                if wdir and not os.path.isabs(target):
+                    target = os.path.normpath(os.path.join(wdir, target))
+            except Exception:
+                pass
+
+        # Never use (in folder) fallback
+        if target and target.startswith("(in "):
+            target = ""
+        self.target = target
+        if live_text:
+            self.live_text = live_text
+            self._target_code = self._extract_code(live_text)
+            if not self._displayed_code:
+                self._displayed_code = ""
+            if self._typewriter_timer is None and self.is_expanded:
+                try:
+                    self._typewriter_timer = self.set_interval(0.025, self._typewriter_tick)
+                except Exception:
+                    pass
+        self._spinner_idx = spinner_idx
+
+        # Auto-expand expandable tools (write, edit) while generating; terminal stays collapsed
+        if tool_name.lower() in ("write", "edit"):
+            self.is_expanded = True
+            self.details_widget.styles.display = "block"
+            if self._typewriter_timer is None and self.live_text:
+                try:
+                    self._typewriter_timer = self.set_interval(0.025, self._typewriter_tick)
+                except Exception:
+                    pass
+        else:
+            self.is_expanded = False
+            self.details_widget.styles.display = "none"
+
+        self._update_display(update_details=True)
+
+    def set_spinner_idx(self, idx: int) -> None:
+        self._spinner_idx = idx
+        self._update_display(update_details=False)
+
+    def _update_display(self, update_details: bool = True) -> None:
+        if not self.tool_name or (self.tool_name.lower() in ("write", "edit", "read") and not self.target):
+            self.styles.display = "none"
+            return
+        self.styles.display = "block"
+        frame = self.DOT_SPINNERS[self._spinner_idx % len(self.DOT_SPINNERS)]
+        from ...agent.render import render_tool_header
+        elapsed_s = (time.time() - self.start_time) if self.start_time else None
+        t = render_tool_header(
+            self.tool_name,
+            self.target,
+            is_expanded=self.is_expanded,
+            is_running=True,
+            spinner_frame=frame,
+            elapsed_s=elapsed_s,
+        )
+        try:
+            self.header_widget.update(t)
+        except Exception:
+            pass
+        if update_details and self.is_expanded:
+            self._render_details(self._displayed_code if self._displayed_code else self._target_code)
+
+    def _render_details(self, code_to_show: Optional[str] = None) -> None:
+        if code_to_show is None:
+            code_to_show = self._displayed_code if self._displayed_code else self._target_code
+        if not code_to_show and self.live_text:
+            code_to_show = self._extract_code(self.live_text)
+        if not code_to_show:
+            txt = Text(no_wrap=True)
+            txt.append("  (generating...)\n", style="dim #8b949e")
+            try:
+                self.details_widget.update(txt)
+            except Exception:
+                pass
+            return
+
+        lexer = get_lexer_for_path(self.target)
+        try:
+            from rich.syntax import Syntax
+            syntax = Syntax(
+                code_to_show,
+                lexer,
+                theme="github-dark",
+                line_numbers=True,
+                word_wrap=False,
+                indent_guides=True,
+            )
+            self.details_widget.update(syntax)
+        except Exception:
+            lines = code_to_show.splitlines()
+            txt = Text(no_wrap=True)
+            for idx, line in enumerate(lines, 1):
+                clean_l = str(line).replace("\t", "    ")
+                txt.append(f"  {idx:>4}    ", style="#484f58")
+                txt.append(f"{clean_l}\n", style="#e6edf3")
+            try:
+                self.details_widget.update(txt)
+            except Exception:
+                pass
+
+    def on_click(self, event: events.Click) -> None:
+        # A subagent still being announced has no block yet: open the newest
+        # subagent block, so the window can be entered from the very start.
+        if (self.tool_name or "").lower() in ("subagent", "spawn_subagent", "task"):
+            try:
+                card = next((a for a in self.ancestors if isinstance(a, AssistantTurnCard)), None)
+                blocks = list(getattr(card, "tool_blocks", []) or []) if card else []
+                cand = next((b for b in reversed(blocks)
+                             if getattr(b, "subagent_role", "") or (getattr(b, "tool_name", "") or "").lower() in ("subagent", "task")), None)
+                opener = getattr(self.app, "_open_subagent_chat", None)
+                if cand is not None and callable(opener):
+                    opener(cand)
+                else:
+                    self.app.notify("Subagent is starting — please wait a moment.", title="Subagent", timeout=2.0)
+            except Exception:
+                pass
+            return
+        tl_clean = (self.tool_name or "").lower().strip().replace("-", "").replace("_", "").replace(" ", "")
+        if tl_clean in (
+            "web", "webfetch", "fetch", "searchweb", "websearch", "read", "scratch", "todo",
+            "glob", "search", "grep", "googlesearch", "bravesearch",
+            "ask", "memory", "screenshot", "vision", "models", "agentnote",
+            "cmdaicode", "codeagent",
+        ):
+            return
+        if not self._target_code:
+            return
+        self.is_expanded = not self.is_expanded
+        self.details_widget.styles.display = "block" if self.is_expanded else "none"
+        if self.is_expanded and self._typewriter_timer is None and self._displayed_code != self._target_code:
+            try:
+                self._typewriter_timer = self.set_interval(0.025, self._typewriter_tick)
+            except Exception:
+                pass
+        self._update_display(update_details=True)
+
+    def clear(self) -> None:
+        if self._typewriter_timer is not None:
+            try:
+                self._typewriter_timer.stop()
+            except Exception:
+                pass
+            self._typewriter_timer = None
+        self.tool_name = ""
+        self.target = ""
+        self.live_text = ""
+        self._target_code = ""
+        self._displayed_code = ""
+        self.is_expanded = False
+        self.start_time = None
+        try:
+            self.styles.display = "none"
+            self.header_widget.update("")
+            self.details_widget.update("")
+            self.details_widget.styles.display = "none"
+        except Exception:
+            pass
+
+
+class AssistantTurnCard(Vertical):
+    """Unified assistant turn card containing model header, loading block, thinking block,
+    tool blocks, markdown response, and completion footer (Swift style)."""
+
+    SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    DOT_SPINNERS = ["●", "●", "○", "○"]
+
+    DEFAULT_CSS = """
+    AssistantTurnCard {
+        width: 100%;
+        height: auto;
+    }
+    """
+
+    def __init__(self, model_name: str, initial_text: str = "", has_thinking: Optional[bool] = None, turn_id: int = -1, **kwargs):
+        classes = kwargs.pop("classes", "")
+        classes = f"assistant-card {classes}".strip()
+        super().__init__(classes=classes, **kwargs)
+        self.model_name = model_name
+        self.raw_text = initial_text
+        self.turn_id = turn_id
+        if has_thinking is None:
+            try:
+                from ...core.capabilities import get_model_capability
+                cap = get_model_capability(self.model_name)
+                self.has_thinking = bool(cap and cap.thinking)
+            except Exception:
+                self.has_thinking = False
+        else:
+            self.has_thinking = bool(has_thinking)
+        self.start_time = time.time()
+        self.elapsed: float = 0.0
+        self.is_generating: bool = True
+        self.current_status: str = "generating"
+
+        self.header_widget = _ActionStatic("", classes="card-header")
+        self.loading_container = Vertical(classes="card-loading")
+        self.thinking_container = Vertical(classes="card-thinking")
+        self.flow_container = Vertical(classes="card-flow")
+        self.tools_container = self.flow_container
+        self.body_widget = Static("", classes="card-body")
+        if str(initial_text or "").strip():
+            self.current_body_widget: Optional[Static] = self.body_widget
+            self.body_widgets: List[Static] = [self.body_widget]
+        else:
+            self.current_body_widget = None
+            self.body_widgets = []
+        self.footer_widget = _ActionStatic("", classes="card-footer")
+        # Textual's default Vertical sizing can claim all remaining space in a
+        # scroll view.  Keep each turn content-sized so tool rows never get
+        # pushed to the bottom of an otherwise empty screen.
+        self.styles.height = "auto"
+        for container in (self.loading_container, self.thinking_container, self.flow_container):
+            container.styles.height = "auto"
+            container.styles.min_height = 0
+        self.footer_widget.styles.height = 1
+        self.thinking_container.styles.display = "none"
+        # An empty Vertical container can consume the remaining viewport in a
+        # scrollable parent. It is shown only once it contains chat content.
+        self.flow_container.styles.display = "none"
+        self.body_widget.styles.display = "none"
+
+        self.loading_block: Optional[LoadingBlock] = None
+        self.thinking_block: Optional[ThinkingBlock] = None
+
+        self.live_tool_widget = LiveToolIndicator()
+        self.generating_tool_name: str = ""
+        self.generating_tool_target: str = ""
+        self.current_live_tool_text: str = ""
+        self.tool_blocks: List[ToolBlock] = []
+        self._pending_mounts: List[Any] = []
+        self._last_finalized_text: str = ""
+        self._keep_generating_on_mount: bool = False
+
+        self._spinner_idx = 0
+        self._spinner_timer = None
+
+    def compose(self):
+        yield self.header_widget
+        with self.loading_container:
+            if self.loading_block:
+                yield self.loading_block
+        with self.thinking_container:
+            if self.thinking_block:
+                yield self.thinking_block
+        with self.flow_container:
+            # A card can start with no text yet (the subagent window builds one
+            # from tool events), so the body widget is optional. Only yield in compose
+            # if initial text was provided and no pending mounts were already queued.
+            if not self._pending_mounts and self.current_body_widget is not None and getattr(self, "raw_text", "").strip():
+                yield self.current_body_widget
+        yield self.live_tool_widget
+        yield self.footer_widget
+
+    def on_click(self, event: events.Click) -> None:
+        # Clicking model response does not show action menu (only clicking user question cards does)
+        pass
+
+    def on_mount(self) -> None:
+        self.update_header()
+        if hasattr(self, "_pending_mounts"):
+            for item in self._pending_mounts:
+                try:
+                    self.flow_container.mount(item)
+                except Exception:
+                    pass
+            self._pending_mounts.clear()
+            try:
+                self.flow_container.refresh(layout=True)
+                self.refresh(layout=True)
+            except Exception:
+                pass
+        if self.raw_text:
+            self._render_body(self.raw_text)
+            if getattr(self, "_keep_generating_on_mount", False):
+                self._start_spinner()
+            else:
+                self.finish(0.0)
+        else:
+            self._start_spinner()
+
+    def _start_spinner(self) -> None:
+        self._spinner_idx = 0
+        def _tick():
+            self._spinner_idx = (self._spinner_idx + 1) % len(self.SPINNERS)
+            self.elapsed = time.time() - self.start_time
+            if self.loading_block and not self.loading_block.is_finished:
+                self.loading_block.tick()
+            if self.thinking_block and not self.thinking_block.is_finished:
+                self.thinking_block.tick()
+            if getattr(self, "generating_tool_name", ""):
+                self._update_live_tool_widget()
+        self._spinner_timer = self.set_interval(0.18, _tick)
+
+    def _stop_spinner(self) -> None:
+        if self._spinner_timer:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+
+    def set_generating_tool(self, tool_name: str, target: str = "", live_text: str = "") -> None:
+        self.finish_thinking()
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+        if not target and live_text:
+            import re
+            KEY_PAT = r'(?:\\?"?(?:TargetFile|target_file|targetfile|filePath|filepath|file_path|filename|file_name|dest|destination|file|path|cmd|command|commandLine|command_line|url|query)\\?"?)'
+            m = re.search(KEY_PAT + r'\s*[:=]\s*(?:\\?["\']([^"\'\r\n}>]+)(?:\\?["\'])?|([^"\'\s,}>]+))', live_text, flags=re.IGNORECASE)
+            if not m:
+                m = re.search(r'<(?:TargetFile|target_file|targetfile|filePath|filepath|file_path|filename|file_name|file|path|dest)>([^<>\r\n]+)', live_text, flags=re.IGNORECASE)
+            if m:
+                raw_tgt = m.group(1) or (m.group(2) if len(m.groups()) > 1 else "")
+                target = raw_tgt.replace('\\\\', '\\').replace('\\/', '/').strip('"\'\\')
+            elif tool_name.lower() in ("write", "edit", "read"):
+                first_line = live_text.strip().splitlines()[0].strip() if live_text.strip() else ""
+                if ("." in first_line or "/" in first_line or "\\" in first_line) and len(first_line) < 100:
+                    if not any(k in first_line for k in ("(", ")", ";", "=", "{", "}", "[", "]", ":", "<", ">", '"', "'", "import", "def", "class", "from", "//", "/*", "print", "console", "return", "function", "var", "let", "const")):
+                        target = first_line
+                elif "<!doctype html" in live_text.lower() or "<html" in live_text.lower():
+                    target = "index.html"
+        if target and tool_name.lower() in ("write", "edit", "read"):
+            try:
+                import os
+                app = getattr(self, "app", None)
+                wdir = getattr(app, "workdir", "") if app else ""
+                if wdir and not os.path.isabs(target):
+                    target = os.path.normpath(os.path.join(wdir, target))
+            except Exception:
+                pass
+        if getattr(self, "_tool_generation_start", None) is None:
+            self._tool_generation_start = time.time()
+        self.generating_tool_name = tool_name
+        self.generating_tool_target = target
+        if hasattr(self.live_tool_widget, "update_state"):
+            self.live_tool_widget.update_state(tool_name, target, live_text, self._spinner_idx)
+        self._update_live_tool_widget()
+
+    def clear_generating_tool(self) -> None:
+        self.generating_tool_name = ""
+        self.generating_tool_target = ""
+        self.current_live_tool_text = ""
+        if hasattr(self.live_tool_widget, "clear"):
+            self.live_tool_widget.clear()
+
+    def _update_live_tool_widget(self) -> None:
+        if not getattr(self, "generating_tool_name", ""):
+            if hasattr(self.live_tool_widget, "clear"):
+                self.live_tool_widget.clear()
+            return
+        if self.current_body_widget is not None and not getattr(self, "raw_text", "").strip():
+            try:
+                self.current_body_widget.styles.display = "none"
+            except Exception:
+                pass
+        if hasattr(self.live_tool_widget, "set_spinner_idx"):
+            self.live_tool_widget.set_spinner_idx(self._spinner_idx)
+
+    def update_header(self) -> None:
+        model_display = clean_model_name(self.model_name).lstrip("⌬").strip()
+        t = Text()
+        t.append("⌬  ", style="bold #58a6ff")
+        t.append(model_display, style="bold #e6edf3")
+        t.justify = "center"
+        self.header_widget.update(t)
+
+    def start_loading(self, message: str = "Loading model…") -> LoadingBlock:
+        if self.loading_block is None:
+            self.loading_block = LoadingBlock(message)
+            if self.is_mounted and self.loading_container.is_mounted:
+                self.loading_container.mount(self.loading_block)
+            else:
+                self.call_after_refresh(lambda: self.loading_container.mount(self.loading_block) if self.loading_container.is_mounted else None)
+        return self.loading_block
+
+    def finish_loading(self, elapsed: Optional[float] = None) -> None:
+        if self.loading_block:
+            self.loading_block.finish(elapsed)
+
+    def start_thinking(self, message: str = "Thinking…") -> Optional[ThinkingBlock]:
+        if not self.has_thinking:
+            return None
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+        if self.thinking_block is None or self.thinking_block.is_finished:
+            self.thinking_block = ThinkingBlock()
+            # Round 1 (before any flow items): mount at top in thinking_container.
+            # Subsequent rounds (after text/tools): mount chronologically in flow_container.
+            use_flow = (self.flow_container.styles.display == "block") or bool(self.flow_container.children)
+            target_container = self.flow_container if use_flow else self.thinking_container
+            target_container.styles.display = "block"
+            blk = self.thinking_block
+            if self.is_mounted and target_container.is_mounted:
+                target_container.mount(blk)
+            else:
+                self.call_after_refresh(lambda c=target_container, b=blk: c.mount(b) if c.is_mounted else None)
+        return self.thinking_block
+
+    def append_thinking(self, chunk: str) -> None:
+        if not self.has_thinking:
+            return
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+        if self.thinking_block is None or self.thinking_block.is_finished:
+            self.start_thinking()
+        if self.thinking_block:
+            self.thinking_block.append_chunk(chunk)
+
+    def sync_thinking(self, full_text: str) -> None:
+        """Set full thinking text idempotently across tab switches."""
+        if not full_text:
+            return
+        self.has_thinking = True
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+        if self.thinking_block is None:
+            self.start_thinking()
+        if self.thinking_block:
+            self.thinking_block.thinking_text = full_text
+            self.thinking_block.elapsed = time.time() - self.thinking_block.start_time
+            self.thinking_block.update_header(live=not self.thinking_block.is_finished)
+            if self.thinking_block.is_expanded:
+                self.thinking_block._update_body()
+
+    def finish_thinking(self) -> None:
+        if self.thinking_block:
+            if not self.thinking_block.thinking_text.strip():
+                try:
+                    self.thinking_block.remove()
+                except Exception:
+                    pass
+            else:
+                self.thinking_block.finish()
+            self.thinking_block = None
+
+
+    def add_tool(self, tool_name: str, target: str) -> ToolBlock:
+        self.finish_thinking()
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+        self.flow_container.styles.display = "block"
+        was_live_expanded = bool(getattr(self.live_tool_widget, "is_expanded", False))
+        live_code = (
+            getattr(self.live_tool_widget, "_displayed_code", "")
+            or getattr(self.live_tool_widget, "_target_code", "")
+            or getattr(self.live_tool_widget, "live_text", "")
+        )
+        gen_start = getattr(self, "_tool_generation_start", None)
+        if not target and getattr(self, "generating_tool_target", "") and not self.generating_tool_target.startswith("("):
+            target = self.generating_tool_target
+        if target and target.startswith("(in "):
+            target = ""
+        if target and tool_name.lower() in ("write", "edit", "read"):
+            try:
+                import os
+                app = getattr(self, "app", None)
+                wdir = getattr(app, "workdir", "") if app else ""
+                if wdir and not os.path.isabs(target):
+                    target = os.path.normpath(os.path.join(wdir, target))
+            except Exception:
+                pass
+        self.clear_generating_tool()
+        self._tool_generation_start = None
+
+        # Finish any previous lingering read/write/inspect tools so they don't spin forever
+        for b in (self.flow_container.query(ToolBlock) or self.tool_blocks):
+            if getattr(b, "tool_running", False):
+                b_name = (getattr(b, "tool_name", "") or "").lower()
+                if getattr(b, "is_backgrounded", False) or "background" in str(getattr(b, "target", "")).lower():
+                    continue
+                if getattr(b, "subagent_role", "") or b_name in ("subagent", "task"):
+                    continue
+                if b_name in ("read", "file_read", "web", "fetch", "webfetch", "ls", "grep", "search", "glob") or b_name == tool_name.lower():
+                    b.finish({"result": "completed"})
+
+        # Deduplicate consecutive identical tool blocks for the same target while still running
+        all_blocks = list(self.flow_container.query(ToolBlock)) or self.tool_blocks
+        if all_blocks and target:
+            last_b = all_blocks[-1]
+            if (
+                (getattr(last_b, "tool_name", "") or "").lower() == tool_name.lower()
+                and getattr(last_b, "tool_running", False)
+            ):
+                last_tgt = str(getattr(last_b, "target", "")).split(" (")[0].strip()
+                clean_tgt = str(target).split(" (")[0].strip()
+                if last_tgt and last_tgt == clean_tgt:
+                    # Update existing block rather than creating duplicate row
+                    if gen_start is not None and getattr(last_b, "start_time", None):
+                        last_b.start_time = min(last_b.start_time, gen_start)
+                    return last_b
+
+        # Clean up any dummy placeholder blocks of the same tool (e.g. premature or duplicate)
+        for b in list(self.flow_container.query(ToolBlock) or self.tool_blocks):
+            b_name = (getattr(b, "tool_name", "") or "").lower()
+            b_tgt = str(getattr(b, "target", "")).strip().lower()
+            if b_name == tool_name.lower() and getattr(b, "tool_running", False) and (b_tgt.startswith("<!doctype") or b_tgt in ("placeholder", "working", "running", "(no target)")):
+                try:
+                    b.remove()
+                    if b in self.tool_blocks:
+                        self.tool_blocks.remove(b)
+                except Exception:
+                    pass
+
+        clean_initial_target = target
+        if clean_initial_target and clean_initial_target.strip().lower() in ("placeholder", "(no target)"):
+            clean_initial_target = ""
+        block = ToolBlock(tool_name, clean_initial_target)
+        if gen_start is not None:
+            block.start_time = gen_start
+        if block.tool_name.lower() in ("write", "edit"):
+            block.set_expanded(True)
+            if live_code:
+                block.seed_details(live_code)
+        elif was_live_expanded and block.tool_name.lower() not in ("terminal", "command", "bash", "cmd", "sh", "run_command"):
+            block.set_expanded(True)
+        else:
+            block.set_expanded(False)
+        self.tool_blocks.append(block)
+
+        if self.current_body_widget is not None and not getattr(self, "raw_text", "").strip():
+            if self.current_body_widget in self.body_widgets:
+                self.body_widgets.remove(self.current_body_widget)
+            try:
+                self.current_body_widget.remove()
+            except Exception:
+                pass
+            try:
+                self.current_body_widget.styles.display = "none"
+            except Exception:
+                pass
+
+        if getattr(self, "raw_text", "").strip():
+            self._last_finalized_text = getattr(self, "raw_text", "").strip()
+        self._pre_tool_body_widget = self.current_body_widget
+        self.current_body_widget = None
+        self.raw_text = ""
+
+        def _mount_tool():
+            try:
+                self.flow_container.mount(block)
+            except Exception:
+                try:
+                    self.mount(block)
+                except Exception:
+                    pass
+            try:
+                self.flow_container.refresh(layout=True)
+                self.refresh(layout=True)
+                if self.app:
+                    self.app.refresh()
+            except Exception:
+                pass
+
+        if self.is_mounted and self.flow_container.is_mounted:
+            _mount_tool()
+        else:
+            if not hasattr(self, "_pending_mounts"):
+                self._pending_mounts = []
+            self._pending_mounts.append(block)
+            self.call_after_refresh(_mount_tool)
+            try:
+                self.refresh(layout=True)
+            except Exception:
+                pass
+        return block
+
+    def note_server_tool(self, tool_name: str, phase: str, detail: str) -> None:
+        """A tool the provider ran on its own server.
+
+        Distinct from `add_tool`, which this app calls for tools it executed
+        itself from a `<tool:name>` tag. Here the tool ran somewhere else and
+        the text never named it, so the block is created from the event and
+        then updated in place.
+
+        The provider sends `(name, phase, detail)` with no call id, so
+        consecutive calls of the *same* tool in one turn are matched in
+        completion order. That is right for every provider that reports this
+        way - a tool cannot run and finish twice in the same instant - and it is
+        why the phases are collapsed here rather than matched on identity.
+
+        A server-side subagent (`subagent`, and OpenCode's `task` tool, which
+        its own client groups under "subagents") is not a tool block at all: it
+        becomes a subagent marker, so a click opens the subagent window instead
+        of expanding a row inline. Without this a server subagent rendered as a
+        plain expandable block showing its goal text, while the local one next
+        to it opened a window - same name, two behaviours.
+        """
+        self.finish_thinking()
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+
+        name = str(tool_name or "tool")
+        if name.lower() in ("shell", "bash", "terminal", "sh", "cmd", "run_command", "exec", "powershell", "pwsh", "execute_command", "run_shell_command", "shell_command"):
+            name = "command"
+        phase = str(phase or "running")
+        detail = str(detail or "")
+
+        if name.lower() == "question":
+            self.clear_generating_tool()
+            return
+
+        if name.lower() in ("subagent", "task"):
+            self._note_server_subagent(name, phase, detail)
+            return
+
+        is_execute = name.lower() in ("execute", "eval", "evaluate") or detail.strip().startswith('{"code":')
+        if is_execute:
+            import re
+            raw_d = detail
+            url_m = re.search(r"https?://[^\s'\"`\\]+", raw_d)
+            if ("fetch" in raw_d.lower() or "http" in raw_d.lower()) and url_m:
+                name = "webfetch"
+                detail = url_m.group(0)
+            elif any(k in raw_d.lower() for k in ("child_process", "exec(", "spawn(", "execsync", "bash", "cmd")):
+                name = "command"
+                cmd_m = re.search(r"(?:exec|spawn|execSync)\(\s*['\"]([^'\"]+)['\"]", raw_d)
+                detail = cmd_m.group(1) if cmd_m else "command"
+            else:
+                name = "script"
+                if detail.strip().startswith('{"code":') or "function " in detail or "const " in detail:
+                    detail = ""
+            if phase in ("done", "success"):
+                phase = "failed"
+
+        if phase == "generating":
+            tgt = ""
+            live_txt = detail
+            if detail.strip().startswith("{") and any(k in detail for k in ("live_code", "target", "path", "TargetFile", "file")):
+                try:
+                    import json as _json
+                    payload = _json.loads(detail)
+                    tgt = payload.get("target") or payload.get("path") or payload.get("TargetFile") or payload.get("file") or ""
+                    live_txt = payload.get("live_code") or payload.get("content") or payload.get("code") or detail
+                except Exception:
+                    pass
+            elif len(detail) < 120 and "\n" not in detail:
+                tgt = detail
+            if not tgt and live_txt and name.lower() in ("write", "edit", "read"):
+                import re
+                KEY_PAT = r'(?:\\?"?(?:TargetFile|target_file|targetfile|filePath|filepath|file_path|filename|file_name|dest|destination|file|path)\\?"?)'
+                m = re.search(KEY_PAT + r'\s*:\s*\\?"((?:\\.|[^"\r\n}>])+)', live_txt, flags=re.IGNORECASE)
+                if not m:
+                    m = re.search(KEY_PAT + r'\s*=\s*(?:\\?["\']?)([^"\'\\>\s]+)', live_txt, flags=re.IGNORECASE)
+                if m:
+                    tgt = m.group(1).replace('\\\\', '\\').replace('\\"', '"').replace('\\/', '/').strip('"\'\\')
+                elif "<!doctype html" in live_txt.lower() or "<html" in live_txt.lower():
+                    tgt = "index.html"
+            self.set_generating_tool(name, tgt, live_text=live_txt)
+            return
+
+        if phase == "running":
+            if name.lower() == "read" and detail:
+                d_str = str(detail).strip()
+                for prefix in ("read file ", "reading file ", "read ", "reading "):
+                    if d_str.lower().startswith(prefix):
+                        detail = d_str[len(prefix):].strip()
+                        break
+            block = self.add_tool(name, detail or "running")
+            # Details are otherwise only filled in by `finish`, so expanding a
+            # call that is still running showed an empty box. The target is the
+            # one thing known at this point, and it is what the user clicked on
+            # to find out.
+            if detail:
+                try:
+                    block.seed_details(detail)
+                except Exception:
+                    pass
+            return
+        if phase == "progress":
+            # The call is already on screen; update it rather than adding a row.
+            # A long call publishes progress repeatedly, and treating each one
+            # as a new call filled the chat with copies of the same tool.
+            existing = [b for b in (self.flow_container.query(ToolBlock) or self.tool_blocks)
+                        if getattr(b, "tool_name", None) == name
+                        and getattr(b, "tool_running", False)]
+            if existing:
+                block = existing[-1]
+                if detail and detail.strip().lower() not in ("working", "starting", "…", "..."):
+                    if name.lower() in ("write", "edit") and ("\n" in detail or len(detail) > 80):
+                        block.update_live_code(detail)
+                    else:
+                        block.target = detail
+                        try:
+                            block.update_header()
+                        except Exception:
+                            pass
+                return
+            # If no running call exists yet, do NOT add a new ToolBlock (which would create duplicates)!
+            # Instead, update the live generating indicator:
+            if hasattr(self, "live_tool_widget"):
+                self.set_generating_tool(name, getattr(self, "generating_tool_target", ""), live_text=detail)
+            return
+
+        blocks = [b for b in self.flow_container.query(ToolBlock) or self.tool_blocks
+                  if getattr(b, "tool_name", None) == name]
+        block = None
+        first_line_d = detail.splitlines()[0].strip().lower() if detail.strip() else ""
+        if first_line_d:
+            block = next((b for b in reversed(blocks)
+                          if getattr(b, "tool_running", False)
+                          and (first_line_d in str(b.target).lower() or str(b.target).lower() in first_line_d)), None)
+        if block is None:
+            block = next((b for b in reversed(blocks)
+                          if getattr(b, "tool_running", False)), None)
+        if block is None and first_line_d:
+            block = next((b for b in reversed(blocks)
+                          if first_line_d in str(b.target).lower() or str(b.target).lower() in first_line_d), None)
+        if block is None and is_execute:
+            running_candidates = [b for b in (self.flow_container.query(ToolBlock) or self.tool_blocks)
+                                  if getattr(b, "tool_running", False)]
+            if running_candidates:
+                block = running_candidates[-1]
+        if block is None:
+            self.clear_generating_tool()
+            first_l = detail.splitlines()[0].strip() if detail.strip() else ""
+            if not first_l or first_l.lower() in ("done", "ok", "placeholder"):
+                return
+            # An outcome with no start: still worth showing, or a failure would
+            # be the only thing anyone ever sees.
+            block = self.add_tool(name, first_l)
+
+        try:
+            if phase == "done" and not is_execute:
+                out_body = detail
+                blk_tgt = str(getattr(block, "target", "") or "").split(" (")[0].strip()
+                if blk_tgt and detail.startswith(blk_tgt + "\n"):
+                    out_body = detail[len(blk_tgt) + 1:]
+                elif blk_tgt and detail.strip() == blk_tgt:
+                    out_body = ""
+                res_dict: Dict[str, Any] = {"success": True, "result": out_body or detail}
+                if name.lower() in ("command", "shell", "bash", "terminal", "sh", "cmd", "run_command", "exec"):
+                    res_dict["stdout"] = out_body
+                block.finish(res_dict)
+            else:
+                err_body = detail
+                blk_tgt = str(getattr(block, "target", "") or "").split(" (")[0].strip()
+                if blk_tgt and detail.startswith(blk_tgt + "\n"):
+                    err_body = detail[len(blk_tgt) + 1:]
+                block.finish({"error": err_body or detail or "failed"})
+        except Exception:
+            pass
+
+
+
+    def _note_server_subagent(self, tool_name: str, phase: str, detail: str) -> None:
+        """A subagent the provider ran on its own server, as a marker.
+
+        Same contract as a locally spawned one: a click opens the subagent
+        window, and the marker never expands inline. The server gives no
+        transcript in this app's format, so the marker carries what the events
+        did say - the goal it started with and one event per outcome, which is
+        """
+        self.finish_thinking()
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+
+        # Defensive JSON parsing for server-side subagent events
+        sub_role = None
+        sub_goal = None
+        sub_tool_ev = None
+        if detail.strip().startswith("{") and any(k in detail for k in ("sub_event", "tool", "role", "goal", "task")):
+            try:
+                import json as _json
+                data = _json.loads(detail)
+                if isinstance(data, dict):
+                    sub_role = str(data.get("role") or "").strip() or None
+                    sub_goal = str(data.get("goal") or "").strip() or None
+                    sev = data.get("sub_event")
+                    if sev == "tool_called":
+                        t_name = str(data.get("tool") or "").strip()
+                        if t_name.lower() in ("shell", "bash", "terminal", "sh", "cmd", "run_command", "exec", "powershell", "pwsh", "command"):
+                            t_name = "command"
+                        t_tgt = str(data.get("target") or "").strip()
+                        detail = f"{t_name} {t_tgt}".strip() if t_tgt else t_name
+                    elif sev == "tool_done":
+                        t_name = str(data.get("tool") or "").strip()
+                        if t_name.lower() in ("shell", "bash", "terminal", "sh", "cmd", "run_command", "exec", "powershell", "pwsh", "command"):
+                            t_name = "command"
+                        t_tgt = str(data.get("target") or "").strip()
+                        t_out = str(data.get("output") or "").strip()
+                        detail = f"{t_name} {t_tgt}".strip() if t_tgt else t_name
+                        sub_tool_ev = {
+                            "tool": t_name,
+                            "target": t_tgt,
+                            "result": {"success": bool(data.get("ok", True)), "content": t_out},
+                            "ok": bool(data.get("ok", True)),
+                        }
+                    elif sev == "text_delta":
+                        detail = str(data.get("text") or "").strip()
+                    elif data.get("task"):
+                        detail = str(data.get("task") or "").strip()
+            except Exception:
+                pass
+
+        blocks = [b for b in (self.flow_container.query(ToolBlock) or self.tool_blocks)
+                  if getattr(b, "tool_name", None) in ("subagent", "task")
+                  and getattr(b, "subagent_role", "")]
+        block = next((b for b in reversed(blocks)
+                      if getattr(b, "tool_running", False)), None)
+        if block is None:
+            try:
+                app = getattr(self, "app", None)
+                if app:
+                    all_blocks = [b for b in app.query(ToolBlock)
+                                  if getattr(b, "tool_name", None) in ("subagent", "task")
+                                  and getattr(b, "subagent_role", "")
+                                  and getattr(b, "tool_running", False)]
+                    if all_blocks:
+                        block = all_blocks[-1]
+            except Exception:
+                pass
+
+        if phase in ("running", "progress") and block is None:
+            block = self.add_tool("subagent", detail or "running")
+            block.subagent_role = sub_role or "Subagent"
+            block.subagent_goal = sub_goal or (detail if not detail.strip().startswith("{") else "Subagent task")
+            block.subagent_status = "running"
+            if sub_tool_ev:
+                block.subagent_events.append(sub_tool_ev)
+            try:
+                block.update_header()
+            except Exception:
+                pass
+            return
+
+        if block is None:
+            # An outcome with no start. Still a marker, or a failure would open
+            # nothing and the error would have nowhere to live.
+            block = self.add_tool("subagent", detail or "done")
+            block.subagent_role = sub_role or "Subagent"
+            block.subagent_goal = sub_goal or (detail if not detail.strip().startswith("{") else "Subagent task")
+            block.subagent_status = "running"
+
+        if sub_role and block:
+            block.subagent_role = sub_role
+        if sub_goal and block and not getattr(block, "subagent_goal", ""):
+            block.subagent_goal = sub_goal
+        if sub_tool_ev and block:
+            block.subagent_events.append(sub_tool_ev)
+
+        if phase == "progress":
+            # The live line, not a new row: progress arrives repeatedly and each
+            # one opened another block before this existed.
+            if detail:
+                low = detail.strip().lower()
+                if low in ("working", "starting", "…", "..."):
+                    # A placeholder, not information. Overwriting the live line
+                    # with it replaced the file being read with the word
+                    # "Working" - which is what a whole window ended up showing.
+                    return
+                block.subagent_live_tool = detail
+                # ... and a line in the window, or the window shows the live
+                # line and nothing else. Placeholders ("working", "starting")
+                # say nothing beyond "it runs", so only real details land here.
+                low = detail.strip().lower()
+                if low and low not in ("working", "starting", "…", "...") and not low.startswith("{"):
+                    tool_kw = ("read", "edit", "write", "glob", "search", "shell", "command", "terminal", "bash", "ls", "scratch", "todo")
+                    words = detail.strip().split(None, 1)
+                    t_cand = words[0].lower() if words else ""
+                    if t_cand in tool_kw:
+                        t_arg = words[1].strip() if len(words) > 1 else ""
+                        ev_item = {"tool": t_cand, "target": t_arg, "ok": True}
+                        if not any(e.get("tool") == t_cand and e.get("target") == t_arg for e in block.subagent_events[-5:]):
+                            block.subagent_events.append(ev_item)
+                    else:
+                        notes = block.subagent_notes
+                        if not notes or notes[-1] != detail:
+                            notes.append(detail)
+                            del notes[:max(0, len(notes) - 30)]
+                try:
+                    block.update_header()
+                except Exception:
+                    pass
+            return
+
+        block.subagent_events.append({
+            "tool": tool_name,
+            "target": detail,
+            "result": {"success": phase == "done", "content": detail},
+            "ok": phase == "done",
+        })
+        block.subagent_status = "completed" if phase == "done" else "failed"
+        try:
+            if phase == "done":
+                block.finish({"result": detail} if detail else {})
+            else:
+                block.finish({"error": detail or "failed"})
+        except Exception:
+            pass
+
+    def append_summary_chunk(self, chunk: str) -> None:
+        blocks = list(self.flow_container.query(ToolBlock)) or self.tool_blocks
+        for b in reversed(blocks):
+            if getattr(b, "tool_running", False) and (getattr(b, "tool_name", "") or "").lower() in ("summarizing", "summarize", "compact", "context_compact"):
+                if hasattr(b, "append_summary_chunk"):
+                    b.append_summary_chunk(chunk)
+                break
+
+    def finish_tool(self, result: Dict[str, Any]) -> None:
+        self.clear_generating_tool()
+        blocks = list(self.flow_container.query(ToolBlock)) or self.tool_blocks
+        want_sum = isinstance(result, dict) and "summary" in result
+        for b in reversed(blocks):
+            if getattr(b, "tool_running", False) and not getattr(b, "is_backgrounded", False):
+                if want_sum and (getattr(b, "tool_name", "") or "").lower() not in ("summarizing", "summarize", "compact", "context_compact"):
+                    continue
+                b.finish(result)
+                break
+        else:
+            if want_sum:
+                sum_blocks = [
+                    b for b in blocks
+                    if (getattr(b, "tool_name", "") or "").lower() in ("summarizing", "summarize", "compact", "context_compact")
+                ]
+                if sum_blocks:
+                    sum_blocks[-1].finish(result)
+            else:
+                non_bg = [b for b in blocks if not getattr(b, "is_backgrounded", False)]
+                if non_bg and getattr(non_bg[-1], "tool_running", False):
+                    non_bg[-1].finish(result)
+
+        try:
+            self.flow_container.refresh(layout=True)
+            self.refresh(layout=True)
+            if self.app:
+                self.app.refresh()
+        except Exception:
+            pass
+
+    def finish_running_tools(self, default_result: Optional[Dict[str, Any]] = None) -> None:
+        """Closes any orphaned or lingering tool blocks."""
+        blocks = list(self.flow_container.query(ToolBlock)) or self.tool_blocks
+        for b in blocks:
+            if getattr(b, "tool_running", False):
+                b_name = (getattr(b, "tool_name", "") or "").lower()
+                if getattr(b, "is_backgrounded", False) or "background" in str(getattr(b, "target", "")).lower():
+                    continue
+                if getattr(b, "subagent_role", "") or b_name in ("subagent", "task"):
+                    if not self.is_generating:
+                        is_cancelled = bool(default_result and str(default_result.get("error", "")).lower() == "cancelled")
+                        b.finish_subagent({
+                            "role": getattr(b, "subagent_role", "") or "Subagent",
+                            "goal": getattr(b, "subagent_goal", "") or "",
+                            "status": "cancelled" if is_cancelled else "completed",
+                            "summary": str(getattr(b, "thinking", "") or ""),
+                            "history": list(getattr(b, "subagent_history", []) or []),
+                            "events": list(getattr(b, "subagent_events", []) or []),
+                            "findings": list(getattr(b, "subagent_findings", []) or []),
+                            "notes": list(getattr(b, "subagent_notes", []) or []),
+                        })
+                    continue
+                b.finish(default_result or {"result": "completed"})
+
+    def append_token(self, chunk: str) -> None:
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+        if self.thinking_block and not self.thinking_block.is_finished:
+            self.thinking_block.finish()
+        self.raw_text += chunk
+        self._render_body(self.raw_text)
+
+    def update_content(self, text: str) -> None:
+        self.raw_text = text
+        self._render_body(text)
+
+    def update_pre_tool_content(self, text: str) -> None:
+        """Update the text widget positioned above a currently-running server tool."""
+        w = getattr(self, "_pre_tool_body_widget", None)
+        import re
+        text = re.sub(r'</?(?:tool_response|tool_call|function_call)[^>]*>', '', str(text or ''), flags=re.IGNORECASE).strip()
+        if w is not None and text.strip():
+            self._last_finalized_text = text.strip()
+            try:
+                w.styles.display = "block"
+                w.update(Markdown(text))
+            except Exception:
+                try:
+                    w.update(Text(text, style="white"))
+                except Exception:
+                    pass
+
+    def update_last_body(self, text: str) -> None:
+        import re
+        text = re.sub(r'</?(?:tool_response|tool_call|function_call)[^>]*>', '', str(text or ''), flags=re.IGNORECASE).strip()
+        last_final = getattr(self, "_last_finalized_text", "").strip()
+        if last_final:
+            clean_text = text.strip()
+            if clean_text == last_final:
+                return
+            if clean_text.startswith(last_final):
+                text = text[len(last_final):].lstrip("\r\n")
+                if not text.strip():
+                    return
+        if not text.strip():
+            if self.current_body_widget is not None:
+                try:
+                    self.current_body_widget.styles.display = "none"
+                    self.current_body_widget.update("")
+                except Exception:
+                    pass
+            self.raw_text = ""
+            return
+        self.update_content(text)
+
+    def append_text_block(self, text: str) -> None:
+        """Appends a new chronological text commentary block into flow_container."""
+        self.finish_thinking()
+        self.finish_running_tools()
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+        import re
+        text = re.sub(r'</?(?:tool_response|tool_call|function_call)[^>]*>', '', str(text or ''), flags=re.IGNORECASE).strip()
+        if not text:
+            return
+        last_final = getattr(self, "_last_finalized_text", "").strip()
+        if last_final:
+            clean_text = text.strip()
+            if clean_text == last_final:
+                return
+            if clean_text.startswith(last_final):
+                text = text[len(last_final):].lstrip("\r\n")
+                if not text.strip():
+                    return
+        self.flow_container.styles.display = "block"
+        new_body = Static("", classes="card-body")
+        self.current_body_widget = new_body
+        self.body_widgets.append(new_body)
+        self.raw_text = text
+
+        def _mount_body():
+            try:
+                self.flow_container.mount(new_body)
+            except Exception:
+                try:
+                    self.mount(new_body)
+                except Exception:
+                    pass
+            try:
+                self.flow_container.refresh(layout=True)
+                self.refresh(layout=True)
+                if self.app:
+                    self.app.refresh()
+            except Exception:
+                pass
+
+        if self.is_mounted and self.flow_container.is_mounted:
+            _mount_body()
+        else:
+            if not hasattr(self, "_pending_mounts"):
+                self._pending_mounts = []
+            self._pending_mounts.append(new_body)
+            self.call_after_refresh(_mount_body)
+            try:
+                self.refresh(layout=True)
+            except Exception:
+                pass
+
+        try:
+            new_body._raw_markdown = text
+            is_err = is_api_error_message(text)
+            new_body.styles.display = "block"
+            if is_err:
+                new_body.update(Text(text, style="bold #f85149"))
+            else:
+                new_body.update(Markdown(text))
+        except Exception:
+            new_body.update(Text(text, style="bold #f85149" if is_err else "white"))
+
+    def resume_turn(self) -> None:
+        """Resumes the active card after a background task finishes so the model continues seamlessly."""
+        self.is_generating = True
+        self._replay_finished_done = False
+        try:
+            self.footer_widget.update("")
+            self.footer_widget.styles.display = "none"
+        except Exception:
+            pass
+        self.prepare_for_next_turn()
+        self.update_header()
+
+    def prepare_for_next_turn(self) -> None:
+        """Resets active body pointer so the next autonomous turn appends below preceding tools/text."""
+        self.finish_thinking()
+        self.clear_generating_tool()
+        self.finish_running_tools()
+        if self.is_generating:
+            try:
+                self.footer_widget.update("")
+            except Exception:
+                pass
+        if getattr(self, "raw_text", "").strip():
+            self._last_finalized_text = getattr(self, "raw_text", "").strip()
+        self.current_body_widget = None
+        self.raw_text = ""
+
+    def _render_body(self, text: str) -> None:
+        import re
+        text = re.sub(r'</?(?:tool_response|tool_call|function_call)[^>]*>', '', str(text or ''), flags=re.IGNORECASE).strip()
+        if not text:
+            if self.current_body_widget is not None:
+                self.current_body_widget.update("")
+            return
+
+        last_final = getattr(self, "_last_finalized_text", "").strip()
+        if last_final:
+            clean_text = text.strip()
+            if clean_text == last_final:
+                if self.current_body_widget is not None:
+                    try:
+                        self.current_body_widget.styles.display = "none"
+                        self.current_body_widget.update("")
+                    except Exception:
+                        pass
+                return
+            if clean_text.startswith(last_final):
+                text = text[len(last_final):].lstrip("\r\n")
+                if not text.strip():
+                    if self.current_body_widget is not None:
+                        try:
+                            self.current_body_widget.styles.display = "none"
+                            self.current_body_widget.update("")
+                        except Exception:
+                            pass
+                    return
+
+        self.flow_container.styles.display = "block"
+
+        if self.current_body_widget is None:
+            new_body = Static("", classes="card-body")
+            self.current_body_widget = new_body
+            self.body_widgets.append(new_body)
+
+        if (
+            self.current_body_widget.parent is None
+            and not self.current_body_widget.is_mounted
+            and self.current_body_widget not in getattr(self, "_pending_mounts", [])
+        ):
+            body_to_mount = self.current_body_widget
+
+            def _mount_body():
+                try:
+                    if self.flow_container.is_mounted and body_to_mount.parent is None:
+                        self.flow_container.mount(body_to_mount)
+                    self.flow_container.refresh(layout=True)
+                    self.refresh(layout=True)
+                    if self.app:
+                        self.app.refresh()
+                except Exception:
+                    pass
+
+            if self.is_mounted and self.flow_container.is_mounted:
+                _mount_body()
+            else:
+                if not hasattr(self, "_pending_mounts"):
+                    self._pending_mounts = []
+                self._pending_mounts.append(body_to_mount)
+                self.call_after_refresh(_mount_body)
+                try:
+                    self.refresh(layout=True)
+                except Exception:
+                    pass
+
+        target_w = self.current_body_widget
+        try:
+            target_w._raw_markdown = text
+            is_err = is_api_error_message(text)
+            target_w.styles.display = "block"
+            if is_err:
+                target_w.update(Text(text, style="bold #f85149"))
+            else:
+                target_w.update(Markdown(text))
+        except Exception:
+            target_w.update(Text(text, style="bold #f85149" if is_err else "white"))
+
+    def finish(
+        self,
+        elapsed: Optional[float] = None,
+        tokens: int = 0,
+        tok_s: float = 0.0,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+    ) -> None:
+        self.is_generating = False
+        self._stop_spinner()
+        self.clear_generating_tool()
+        self.finish_running_tools()
+        if elapsed is not None and elapsed > 0:
+            self.elapsed = elapsed
+        elif getattr(self, "elapsed", 0.0) <= 0.05:
+            self.elapsed = max(0.001, time.time() - self.start_time)
+        self.tokens = tokens
+        self.tok_s = tok_s
+        self.tokens_in = tokens_in
+        self.tokens_out = tokens_out
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+        if self.thinking_block and not self.thinking_block.is_finished:
+            self.thinking_block.finish()
+        self.current_status = ""
+        self.update_header()
+        self.update_footer(tokens, tok_s, tokens_in=tokens_in, tokens_out=tokens_out)
+
+    def update_footer(
+        self,
+        tokens: int = 0,
+        tok_s: float = 0.0,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+    ) -> None:
+        t = Text()
+        t.append("⌬  ", style="bold #58a6ff")
+        t.append("Done", style="bold #e6edf3")
+        if self.elapsed > 0.05:
+            t.append(f"  ·  {self.elapsed:.1f}s", style="#8b949e")
+        out_cnt = tokens_out if tokens_out > 0 else tokens
+        is_estimated = False
+        if out_cnt <= 0 and tokens_in <= 0:
+            gen_text = ""
+            for b in getattr(self, "body_widgets", []):
+                gen_text += getattr(b, "_raw_markdown", "") or ""
+            if self.thinking_block:
+                gen_text += getattr(self.thinking_block, "thinking_text", "") or ""
+            if gen_text.strip():
+                out_cnt = max(1, len(gen_text) // 4)
+                is_estimated = True
+                if tok_s <= 0 and self.elapsed > 0:
+                    tok_s = out_cnt / self.elapsed
+
+        if out_cnt > 0:
+            approx = "~" if is_estimated else ""
+            t.append(f"  ·  {approx}{out_cnt} tokens", style="#8b949e")
+            if tokens_in > 0:
+                t.append(f" ({tokens_in} in / {out_cnt} out)", style="dim #8b949e")
+        elif tokens_in > 0:
+            t.append(f"  ·  {tokens_in} tokens in", style="#8b949e")
+        if tok_s > 0:
+            t.append(f"  ({tok_s:.1f} tok/s)", style="dim #8b949e")
+        try:
+            self.footer_widget.styles.display = "block"
+        except Exception:
+            pass
+        self.footer_widget.update(t)
+
+    def abort(self) -> None:
+        self.is_generating = False
+        self.abort_requested = True
+        self._stop_spinner()
+        self.clear_generating_tool()
+        self.finish_running_tools({"error": "cancelled"})
+        self.elapsed = time.time() - self.start_time
+        if self.loading_block and not self.loading_block.is_finished:
+            self.loading_block.finish()
+        if self.thinking_block and not self.thinking_block.is_finished:
+            self.thinking_block.finish()
+        self.current_status = ""
+        self.update_header()
+        t = Text()
+        t.append("⌬  ", style="bold #8b949e")
+        t.append("Cancelled (Esc)", style="#8b949e")
+        t.append(f"  ·  {self.elapsed:.1f}s", style="dim #8b949e")
+        try:
+            self.footer_widget.styles.display = "block"
+        except Exception:
+            pass
+        self.footer_widget.update(t)
+
+
+class ClickableMessage(Vertical):
+    """Backwards-compatible wrapper delegating to UserMessageCard or AssistantTurnCard."""
+
+    def __init__(self, raw_text: str = "", is_user: bool = False, label: str = "", **kwargs):
+        super().__init__(**kwargs)
+        self.raw_text = raw_text
+        self.is_user = is_user
+        self.label_text = label
+        if is_user:
+            self._label_widget = Static("[bold #8b949e]user[/]", classes="card-label")
+            self._body_widget = Static(Text(raw_text, style="white"), classes="card-body")
+        else:
+            model_name = label or "Assistant"
+            self._label_widget = Static(model_name, classes="card-label") if label else None
+            self._body_widget = Static("", classes="card-body")
+
+    def compose(self):
+        if self._label_widget:
+            yield self._label_widget
+        yield self._body_widget
+
+    def on_mount(self) -> None:
+        if self.raw_text:
+            self.update_content(self.raw_text)
+
+    def update_content(self, text: str) -> None:
+        self.raw_text = text
+        if self.is_user:
+            self._body_widget.update(Text(text, style="white"))
+        else:
+            try:
+                self._body_widget.update(Markdown(text))
+            except Exception:
+                self._body_widget.update(Text(text, style="white"))
+
+
+class ThinkingBlock(Vertical):
+    """Thinking block with Swift-identical 2-phase animation, ⌬ / ✻ glyphs, and compact elapsed time."""
+
+    DEFAULT_CSS = """
+    ThinkingBlock {
+        width: 100%;
+        height: auto;
+        margin: 0 0 1 0;
+    }
+    """
+
+    # The pair asked for, in all three places it appears: here, beside the model
+    # name in the input bar, and in /models. It was briefly Braille, to dodge the
+    # fact that both glyphs are East-Asian *ambiguous* width - rich lays them in
+    # one cell, this terminal draws them across two. The dodging was wrong: the
+    # smear came from the glyph's spare cell being overdrawn by *text*, so the
+    # fix is a gap of spaces after the glyph, not a different alphabet.
+    SPINNERS = ["⌬", "✻"]
+
+    def __init__(self, **kwargs):
+        super().__init__(classes="thinking-block", **kwargs)
+        self.thinking_text = ""
+        self.start_time = time.time()
+        self.elapsed: float = 0.0
+        self.is_finished: bool = False
+        self.is_expanded: bool = False
+        self._timer = None
+
+        self.header_widget = Static("", classes="thinking-header")
+        self.body_widget = Static("", classes="thinking-body")
+
+    def compose(self):
+        yield self.header_widget
+        yield self.body_widget
+
+    def on_mount(self) -> None:
+        if not self.is_finished:
+            self.update_header(live=True)
+            if self._timer is None:
+                self._timer = self.set_interval(0.1, self.tick)
+        else:
+            self.update_header(live=False)
+
+    def _update_body(self) -> None:
+        if not self.thinking_text.strip():
+            return
+        try:
+            self.body_widget.update(Markdown(self.thinking_text))
+        except Exception:
+            self.body_widget.update(Text(self.thinking_text, style="#8b949e"))
+
+    def append_chunk(self, chunk: str) -> None:
+        if self.is_finished:
+            return
+        self.thinking_text += chunk
+        self.elapsed = time.time() - self.start_time
+        self.update_header(live=True)
+        if self.is_expanded:
+            self._update_body()
+
+    def tick(self) -> None:
+        if self.is_finished:
+            if self._timer:
+                self._timer.stop()
+                self._timer = None
+            return
+        self.elapsed = time.time() - self.start_time
+        self.update_header(live=True)
+
+    def finish(self, elapsed: Optional[float] = None) -> None:
+        if self.is_finished:
+            return
+        self.is_finished = True
+        if self._timer:
+            self._timer.stop()
+            self._timer = None
+        if not self.thinking_text.strip():
+            self.styles.display = "none"
+            return
+        if elapsed is not None and elapsed > 0:
+            self.elapsed = elapsed
+        elif getattr(self, "elapsed", 0.0) <= 0.0:
+            self.elapsed = max(0.001, time.time() - self.start_time)
+        self.update_header(live=False)
+        self._update_body()
+
+    def update_header(self, live: bool = False) -> None:
+        if not live and not self.thinking_text.strip():
+            try:
+                self.header_widget.update("")
+            except Exception:
+                pass
+            return
+        t = Text()
+        if live:
+            glyph = self.SPINNERS[int(self.elapsed / 0.35) % len(self.SPINNERS)]
+            t.append(f"{glyph}  ", style="#58a6ff")
+            t.append("Thinking", style="#8b949e")
+            t.append(f"  {self.elapsed:.1f}s", style="dim #6e7681")
+        else:
+            # The star is a marker, not an emphasis. It was `bold #ffffff` while
+            # the words beside it were grey, so the one glyph on the line was the
+            # only thing on it lit up.
+            glyph = "✻" if self.is_expanded else "⌬"
+            t.append(f"{glyph}  ", style="#8b949e")
+            if self.elapsed > 0.0:
+                t.append(f"Thought for {max(0.1, self.elapsed):.1f}s", style="#8b949e")
+            else:
+                t.append("Thought", style="#8b949e")
+
+        try:
+            self.header_widget.update(t)
+        except Exception:
+            pass
+
+    def set_expanded(self, expanded: bool) -> None:
+        self.is_expanded = expanded
+        self.update_header(live=not self.is_finished)
+        if expanded:
+            self._update_body()
+        self.body_widget.styles.display = "block" if expanded else "none"
+
+    def on_click(self, event: events.Click) -> None:
+        # Expandable while the model is still thinking. This refused whenever
+        # the block was unfinished, which is the whole time anyone would want to
+        # read it - the reasoning is arriving exactly then, and waiting for the
+        # finish meant waiting for the answer to arrive before reading why.
+        self.set_expanded(not self.is_expanded)
+
+
+class ToolBlock(Vertical):
+    """Collapsible tool block rendered as 1 single gray line with ● vs ○ and animated spinner when running."""
+
+    DEFAULT_CSS = """
+    ToolBlock {
+        width: 100%;
+        height: auto;
+        margin: 0 0 1 0;
+    }
+    ToolBlock .tool-details {
+        width: 100%;
+        height: auto;
+        text-wrap: nowrap;
+        text-overflow: clip;
+        overflow-x: hidden;
+    }
+    ToolBlock .tool-bg-hint {
+        width: 100%;
+        height: auto;
+        display: none;
+    }
+    """
+
+    SPINNERS = ["●", "●", "○", "○"]
+    NON_EXPANDABLE_TOOLS = {
+        "read", "scratch", "glob", "search", "grep",
+        "web", "webfetch", "fetch", "search_web", "web_search", "websearch", "searchweb",
+        "google_search", "brave_search", "duckduckgo_search",
+    }
+
+    def is_tool_expandable(self) -> bool:
+        if getattr(self, "subagent_role", ""):
+            return False
+        tl = (self.tool_name or "").lower().strip()
+        if tl.startswith("tool:"):
+            tl = tl[5:].strip()
+        tl_clean = tl.replace("-", "").replace("_", "").replace(" ", "")
+        if tl in self.NON_EXPANDABLE_TOOLS or tl_clean in (
+            "web", "webfetch", "fetch", "searchweb", "websearch", "read", "scratch", "todo",
+            "glob", "search", "grep", "googlesearch", "bravesearch",
+            "ask", "memory", "screenshot", "vision", "models", "agentnote",
+            "cmdaicode", "codeagent",
+        ):
+            return False
+        return True
+
+    def update_live_code(self, code: str) -> None:
+        """Format and update live code display with line numbers and syntax highlighting."""
+        if not code:
+            return
+        lexer = get_lexer_for_path(self.target)
+        try:
+            from rich.syntax import Syntax
+            syntax = Syntax(code, lexer, theme="github-dark", line_numbers=True, word_wrap=False)
+            self._safe_update_details(syntax)
+        except Exception:
+            lines = code.splitlines()
+            txt = Text(no_wrap=True)
+            for idx, line in enumerate(lines, 1):
+                num_str = f"  {idx:>4}    "
+                clean_l = str(line).replace("\t", "    ")
+                txt.append(num_str, style="#484f58")
+                txt.append(f"{clean_l}\n", style="#e6edf3")
+            self._safe_update_details(txt)
+        if self.is_expanded:
+            self.details_widget.styles.display = "block"
+
+    def __init__(self, tool_name: str, target: str, **kwargs):
+        super().__init__(classes="tool-block", **kwargs)
+        import uuid as _uuid
+        self.tool_uid = _uuid.uuid4().hex[:8]
+        if tool_name.lower() in ("bugs", "tool_bugs", "debug", "scan_bugs") or "syntax error" in str(target).lower() or "scanning project" in str(target).lower():
+            target = ""
+        if target:
+            if str(target).strip().startswith("(in "):
+                target = ""
+            tl = tool_name.lower()
+            t_str = str(target).strip()
+            if tl == "read":
+                for prefix in ("read file ", "reading file ", "read ", "reading "):
+                    if t_str.lower().startswith(prefix):
+                        target = t_str[len(prefix):].strip()
+                        break
+            elif tl in ("edit", "write"):
+                for prefix in (f"{tl} file ", f"{tl}ing file ", f"{tl} "):
+                    if t_str.lower().startswith(prefix):
+                        target = t_str[len(prefix):].strip()
+                        break
+        has_initial_err = False
+        if tool_name.lower() in ("execute", "eval", "evaluate") or str(target).strip().startswith('{"code":'):
+            import re
+            raw_t = str(target)
+            url_m = re.search(r"https?://[^\s'\"`\\]+", raw_t)
+            if ("fetch" in raw_t.lower() or "http" in raw_t.lower()) and url_m:
+                tool_name = "webfetch"
+                target = url_m.group(0)
+            elif any(k in raw_t.lower() for k in ("child_process", "exec(", "spawn(", "execsync", "bash", "cmd")):
+                tool_name = "terminal"
+                cmd_m = re.search(r"(?:exec|spawn|execSync)\(\s*['\"]([^'\"]+)['\"]", raw_t)
+                target = cmd_m.group(1) if cmd_m else "command"
+            else:
+                tool_name = "script"
+                target = ""
+            has_initial_err = True
+        self.tool_name = tool_name
+        self.target = target
+        self.is_expanded = False
+        self.tool_running = True
+        self.has_error = has_initial_err
+        self.result_data: Optional[Dict[str, Any]] = None
+        self.details_text: str = ""
+        self.h_offset: int = 0
+        self._original_details: Optional[Text] = None
+        self._is_mouse_hovered: bool = False
+        self._spinner_idx = 0
+        self._spinner_timer = None
+        self.start_time: float = time.time()
+        self.elapsed_text: str = ""
+        self.is_backgrounded: bool = False
+        self.bg_task_id: str = ""
+
+        # Subagent-only state. A subagent block shows its role instead of the
+        # literal tool name and keeps the live session data so a click can open
+        # the subagent chat.
+        self.subagent_role: str = ""
+        self.subagent_status: str = "running"
+        self.subagent_index: int = 1
+        self.subagent_total: int = 1
+        self.subagent_goal: str = ""
+        self.subagent_system: str = ""
+        self.subagent_history: List[Dict[str, Any]] = []
+        self.subagent_findings: List[str] = []
+        self.subagent_notes: List[str] = []
+        self.subagent_tool_count: int = 0
+        self.subagent_live_tool: str = ""
+        self.subagent_tokens: int = 0
+        self.subagent_elapsed: float = 0.0
+        self.subagent_events: List[Dict[str, Any]] = []
+
+        self.summary_live_text: str = ""
+        self.header_widget = Static("", classes="tool-header")
+        is_sum_init = self.tool_name.lower() in ("summarizing", "summarize", "compact", "context_compact")
+        self.details_widget = Static("", classes="thinking-body" if is_sum_init else "tool-details")
+        self.details_widget.styles.display = "none"
+        if is_sum_init:
+            self.details_widget.styles.text_wrap = "wrap"
+            init_txt = Text("Summarizing conversation history…", style="dim #8b949e")
+            self._original_details = init_txt
+            self.details_text = init_txt.plain
+        else:
+            self.details_widget.styles.text_wrap = "nowrap"
+            self.details_widget.styles.text_overflow = "clip"
+            self.details_widget.styles.overflow_x = "hidden"
+        self.bg_hint_widget = Static("", classes="tool-bg-hint")
+        self.bg_hint_widget.styles.display = "none"
+
+    def compose(self):
+        yield self.header_widget
+        yield self.details_widget
+        yield self.bg_hint_widget
+
+    def on_mount(self) -> None:
+        self.update_header()
+        if self._original_details is not None:
+            try:
+                self.details_widget.update(self._original_details)
+            except Exception:
+                pass
+        if self.tool_running:
+            self._start_spinner()
+
+    def append_summary_chunk(self, chunk: str) -> None:
+        if not chunk or not self.tool_running:
+            return
+        self.summary_live_text += str(chunk)
+        self.details_text = self.summary_live_text
+        try:
+            md = Markdown(self.summary_live_text)
+            self._original_details = md
+            if self.is_expanded:
+                self.details_widget.update(md)
+        except Exception:
+            txt = Text(self.summary_live_text, style="#8b949e")
+            self._original_details = txt
+            if self.is_expanded:
+                self.details_widget.update(txt)
+
+    def on_enter(self, event: events.Enter) -> None:
+        self._is_mouse_hovered = True
+
+    def on_leave(self, event: events.Leave) -> None:
+        self._is_mouse_hovered = False
+
+    def on_mouse_scroll_left(self, event: events.MouseScrollLeft) -> None:
+        if self.is_expanded:
+            self.shift_horizontal(-6)
+            event.stop()
+
+    def on_mouse_scroll_right(self, event: events.MouseScrollRight) -> None:
+        if self.is_expanded:
+            self.shift_horizontal(6)
+            event.stop()
+
+    def _start_spinner(self) -> None:
+        def _tick():
+            if not self.tool_running:
+                self._stop_spinner()
+                return
+            elapsed = time.time() - self.start_time
+            tl = (self.tool_name or "").lower()
+            if tl in ("read", "file_read", "ls", "grep", "search", "glob") and elapsed > 20.0:
+                self.finish({"result": f"(Completed in {elapsed:.1f}s)"})
+                return
+            self._spinner_idx = (self._spinner_idx + 1) % len(self.SPINNERS)
+            self.elapsed_text = f"{elapsed:.1f}s"
+
+            is_cmd_or_subagent = bool(self.subagent_role) or tl in (
+                "command", "terminal", "shell", "bash", "cmd", "run_command", "sh", "exec", "subagent"
+            )
+            is_subagent = bool(self.subagent_role) or tl in ("subagent", "task")
+            is_local_prov = str(getattr(getattr(self, "app", None), "current_provider", "") or "").lower() in ("local_gguf", "localllmapi")
+            can_bg = is_cmd_or_subagent and not (is_subagent and is_local_prov)
+            if self.tool_running and can_bg and elapsed >= 1.5 and not getattr(self, "is_backgrounded", False):
+                if self.bg_hint_widget.styles.display != "block":
+                    from rich.text import Text
+                    self.bg_hint_widget.update(Text("\n  [Ctrl+B] send to background", style="dim #8b949e"))
+                    self.bg_hint_widget.styles.display = "block"
+            else:
+                if self.bg_hint_widget.styles.display != "none":
+                    self.bg_hint_widget.styles.display = "none"
+
+            self.update_header()
+        is_sum = (self.tool_name or "").lower() in ("summarizing", "summarize", "compact", "context_compact")
+        self._spinner_timer = self.set_interval(0.10 if is_sum else 0.18, _tick)
+
+    def _stop_spinner(self) -> None:
+        if self._spinner_timer:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+
+    def seed_details(self, text: str) -> None:
+        """Give a still-running block something to show when it is clicked.
+
+        `finish` fills the details in, and until then they are empty - so
+        expanding a running tool rendered an empty box, which reads as "the
+        click did nothing" rather than "this has no result yet".
+        """
+        text = str(text or "").strip()
+        if not text:
+            return
+        tl = (self.tool_name or "").lower()
+        if tl in ("write", "edit") and ("\n" in text or len(text) > 80):
+            self.update_live_code(text)
+            return
+        if tl in ("terminal", "command", "shell", "bash", "sh", "cmd", "run_command", "exec"):
+            # When terminal command is running, do not seed the raw command text as output!
+            # The header already shows the command; the details box must display output.
+            txt = Text(no_wrap=True)
+            txt.append("  (running command...)\n", style="dim #8b949e")
+            self._original_details = txt
+            self.details_text = ""
+            try:
+                self.details_widget.update(self._original_details)
+            except Exception:
+                pass
+            return
+        self._original_details = Text(text, no_wrap=True)
+        self.details_text = text
+        try:
+            self.details_widget.update(self._original_details)
+        except Exception:
+            pass
+
+    def mark_backgrounded(self, task_id: str = "") -> None:
+        """Mark this tool/subagent block as running in background."""
+        self.is_backgrounded = True
+        if task_id:
+            self.bg_task_id = str(task_id)
+        if hasattr(self, "bg_hint_widget"):
+            self.bg_hint_widget.styles.display = "none"
+        self.update_header()
+
+    def update_header(self) -> None:
+        is_sum = (self.tool_name or "").lower() in ("summarizing", "summarize", "compact", "context_compact")
+        if is_sum and self.tool_running:
+            elapsed = max(0.0, time.time() - self.start_time)
+            frame = ["⌬", "✻"][int(elapsed / 0.35) % 2]
+        else:
+            frame = self.SPINNERS[self._spinner_idx % len(self.SPINNERS)] if self.tool_running else ""
+        display_name = self.subagent_role if self.subagent_role else ""
+        target = self.target
+        if self.subagent_role:
+            # "<role>  <tool> <path>" while it works, "<role>  complete" when it
+            # is done. Between tools there is no live tool, so the line is just
+            # the role with its spinner - keeping "starting" or the previous
+            # tool's path there made it look like it was looking at the wrong
+            # file. self.target only becomes "complete" once finish_subagent
+            # has run, which is why tool_running, not the status string, is
+            # what decides: the orchestrator emits "completed" before the block
+            # is closed out.
+            if self.subagent_live_tool:
+                target = self.subagent_live_tool
+            elif self.tool_running:
+                if getattr(self, "subagent_events", None):
+                    last_ev = self.subagent_events[-1]
+                    l_tool = str(last_ev.get("tool", "") or "")
+                    l_tgt = str(last_ev.get("target", "") or "")
+                    target = f"{l_tool} {l_tgt}".strip() if l_tool else "thinking…"
+                elif self.target and self.target != "starting":
+                    target = self.target
+                else:
+                    target = "thinking…"
+            else:
+                target = self.target
+            if target and str(target).strip().startswith("{") and any(k in str(target) for k in ("sub_event", "tool", "goal", "role", "text")):
+                try:
+                    import json as _json
+                    p = _json.loads(str(target))
+                    if isinstance(p, dict):
+                        target = f"{p.get('tool', '')} {p.get('target', '')}".strip() or p.get("text", "") or ""
+                except Exception:
+                    pass
+            target = ("  " + str(target).strip()) if str(target).strip() else ""
+        is_exp = self.is_expanded if self.is_tool_expandable() else False
+        text = render_tool_header(
+            self.tool_name,
+            target,
+            is_expanded=is_exp,
+            is_running=self.tool_running,
+            spinner_frame=frame,
+            is_error=self.has_error,
+            display_name=display_name,
+            elapsed_str=self.elapsed_text,
+            is_background=bool(getattr(self, "is_backgrounded", False)),
+            bg_task_id=str(getattr(self, "bg_task_id", "") or ""),
+        )
+        try:
+            self.header_widget.update(text)
+        except Exception:
+            pass
+
+    def set_subagent_progress(self, progress: Any) -> None:
+        """Mirror a SubagentProgress event into the chat marker."""
+        try:
+            tool = str(getattr(progress, "current_tool", "") or "")
+            arg = str(getattr(progress, "tool_arg", "") or "")
+            thought = str(getattr(progress, "thought", "") or getattr(progress, "thinking", "") or "")
+            if thought:
+                self.thinking = thought
+            if tool.lower() == "thinking":
+                self.subagent_live_tool = "Thinking …"
+            elif tool in ("",):
+                if getattr(self, "subagent_events", None):
+                    last_ev = self.subagent_events[-1]
+                    l_tool = str(last_ev.get("tool", "") or "")
+                    if l_tool.lower() in ("shell", "bash", "terminal", "sh", "cmd", "run_command", "exec", "powershell", "pwsh", "command"):
+                        l_tool = "command"
+                    l_tgt = str(last_ev.get("target", "") or "")
+                    self.subagent_live_tool = f"{l_tool} {l_tgt}".strip() if l_tool else ""
+                else:
+                    self.subagent_live_tool = ""
+            elif tool and tool not in ("loading model", "agent_note"):
+                clean_arg = arg.strip()
+                tl = tool.lower()
+                if tl in ("shell", "bash", "terminal", "sh", "cmd", "run_command", "exec", "powershell", "pwsh", "command"):
+                    tool = "command"
+                    tl = "command"
+                if tl == "read":
+                    for prefix in ("read file ", "reading file ", "read ", "reading "):
+                        if clean_arg.lower().startswith(prefix):
+                            clean_arg = clean_arg[len(prefix):].strip()
+                            break
+                elif tl in ("edit", "write"):
+                    for prefix in (f"{tl} file ", f"{tl}ing file ", f"{tl} "):
+                        if clean_arg.lower().startswith(prefix):
+                            clean_arg = clean_arg[len(prefix):].strip()
+                            break
+                elif clean_arg.lower().startswith(f"{tl} "):
+                    clean_arg = clean_arg[len(tl) + 1:].strip()
+                self.subagent_live_tool = f"{tool} {clean_arg}".strip() if clean_arg else tool
+            if tool == "agent_note":
+                note = str(getattr(progress, "note", "") or "")
+                if note and note not in self.subagent_notes:
+                    self.subagent_notes.append(note)
+            hist = getattr(progress, "history", None) or []
+            self.subagent_history = list(hist)
+            self.subagent_events = list(getattr(progress, "events", None) or [])
+            finds = getattr(progress, "findings", None) or []
+            self.subagent_findings = list(finds)
+            status = str(getattr(progress, "status", "") or "")
+            if status:
+                self.subagent_status = status
+            self.subagent_tool_count = sum(
+                1 for m in self.subagent_history
+                if m.get("role") == "user" and str(m.get("content", "")).startswith("[tool:")
+            )
+            self.update_header()
+        except Exception:
+            pass
+
+
+
+    def finish_subagent(self, agent: Dict[str, Any]) -> None:
+        """Close out one subagent marker from its SubagentResult payload."""
+        try:
+            self.tool_running = False
+            self._stop_spinner()
+            if hasattr(self, "bg_hint_widget"):
+                self.bg_hint_widget.styles.display = "none"
+            self.result_data = agent
+            if agent.get("is_backgrounded") or agent.get("background"):
+                self.is_backgrounded = True
+            st = str(agent.get("status", "completed")).lower()
+            self.subagent_status = st
+            self.subagent_goal = str(agent.get("goal", "") or self.subagent_goal)
+            self.subagent_system = str(agent.get("system_prompt", "") or self.subagent_system)
+            hist = agent.get("history") or []
+            if hist:
+                self.subagent_history = list(hist)
+            self.subagent_findings = list(agent.get("findings") or [])
+            self.subagent_notes = list(agent.get("notes") or [])
+            self.subagent_tool_count = int(agent.get("tool_count", 0) or 0)
+            self.subagent_live_tool = ""
+            self.subagent_events = list(agent.get("events") or [])
+            self.has_error = (st == "failed")
+
+            summary = str(agent.get("summary", "")).strip()
+            if st in ("cancelled", "stopped"):
+                self.target = "cancelled"
+                self.subagent_live_tool = "Cancelled"
+            elif self.has_error:
+                # Keep the reason visible; render_tool_header adds "[failed]".
+                first = (str(agent.get("error", "") or summary).splitlines() or ["error"])[0]
+                self.target = first.strip()[:70] or "error"
+            else:
+                self.target = ""
+            self.subagent_tokens = int(agent.get("tokens", 0) or 0)
+            # The orchestrator measures the real runtime; fall back to the local
+            # clock only when it did not report one.
+            reported = float(agent.get("elapsed", 0.0) or 0.0)
+            if reported > 0:
+                self.subagent_elapsed = reported
+            else:
+                started = getattr(self, "subagent_started", None)
+                if started:
+                    import time as _time
+                    self.subagent_elapsed = max(0.0, _time.monotonic() - started)
+
+            # No details body: a subagent marker never expands, so the chat
+            # window is the only place the report, findings and notes appear.
+            self._safe_update_details(Text(""))
+            self.update_header()
+            self.refresh(layout=True)
+        except Exception:
+            pass
+
+    def _safe_update_details(self, content: Any) -> None:
+        try:
+            from rich.syntax import Syntax
+            if isinstance(content, Text):
+                self._original_details = content
+                self.details_text = content.plain
+            elif isinstance(content, Syntax):
+                self._original_details = content
+                self.details_text = getattr(content, "code", "")
+            elif isinstance(content, Markdown):
+                self._original_details = content
+                self.details_text = getattr(content, "markup", "")
+            elif hasattr(content, "plain"):
+                self._original_details = Text(str(content.plain), no_wrap=True)
+                self.details_text = content.plain
+            else:
+                s = str(content)
+                self._original_details = Text(s, no_wrap=True)
+                self.details_text = s
+            self._apply_horizontal_shift()
+        except Exception:
+            pass
+
+    def shift_horizontal(self, delta: int) -> None:
+        if not self.is_expanded or not self._original_details:
+            return
+        lines = (self.details_text or "").splitlines()
+        max_len = max((len(l) for l in lines), default=0)
+        visible_w = 0
+        try:
+            visible_w = self.details_widget.size.width
+        except Exception:
+            pass
+        if visible_w <= 0:
+            try:
+                visible_w = self.app.size.width
+            except Exception:
+                pass
+        if visible_w <= 0:
+            visible_w = 50
+
+        avail_cols = max(10, visible_w - 6)
+        max_shift = max(0, (max_len + 1) - avail_cols)
+        new_offset = max(0, min(max_shift, self.h_offset + delta))
+        if new_offset != self.h_offset:
+            self.h_offset = new_offset
+            self._apply_horizontal_shift()
+
+    def _apply_horizontal_shift(self) -> None:
+        if not self._original_details:
+            return
+        try:
+            from rich.syntax import Syntax
+            if isinstance(self._original_details, (Syntax, Markdown)) or self.h_offset <= 0:
+                self.details_widget.update(self._original_details)
+                return
+
+            orig_lines = self._original_details.split("\n")
+            shifted = Text(no_wrap=True)
+            for idx, line in enumerate(orig_lines):
+                if len(line) > self.h_offset:
+                    shifted.append_text(line[self.h_offset:])
+                else:
+                    shifted.append("")
+                if idx < len(orig_lines) - 1:
+                    shifted.append("\n")
+            self.details_widget.update(shifted)
+        except Exception:
+            pass
+
+    def finish(self, result: Dict[str, Any]) -> None:
+        self.tool_running = False
+        self._stop_spinner()
+        if hasattr(self, "bg_hint_widget"):
+            self.bg_hint_widget.styles.display = "none"
+        elapsed = time.time() - self.start_time
+        self.elapsed_text = f"{elapsed:.1f}s"
+        if self.tool_name.lower() in ("execute", "eval", "evaluate") or str(self.target).strip().startswith('{"code":'):
+            raw_t = str(self.target)
+            url_m = re.search(r"https?://[^\s'\"`\\]+", raw_t)
+            if ("fetch" in raw_t.lower() or "http" in raw_t.lower()) and url_m:
+                self.tool_name = "webfetch"
+                self.target = url_m.group(0)
+            elif any(k in raw_t.lower() for k in ("child_process", "exec(", "spawn(", "execsync", "bash", "cmd")):
+                self.tool_name = "command"
+                cmd_m = re.search(r"(?:exec|spawn|execSync)\(\s*['\"]([^'\"]+)['\"]", raw_t)
+                self.target = cmd_m.group(1) if cmd_m else "command"
+            else:
+                self.tool_name = "script"
+                self.target = ""
+                self.has_error = True
+
+        is_err = bool(
+            result.get("error")
+            or result.get("success") is False
+            or (self.tool_name in ("command", "terminal") and result.get("exit_code", 0) != 0 and not result.get("success", True))
+            or (getattr(self, "has_error", False) and result.get("success") is not True and self.tool_name not in ("terminal", "command", "webfetch"))
+            or self.tool_name in ("script", "execute")
+        )
+        self.has_error = is_err
+        self.update_header()
+
+        if self.tool_name == "agent_note" and not is_err:
+            # A note to the lead agent. Rendered exactly like any other tool:
+            # one collapsed line, click to read, no special colour.
+            note = str(result.get("note", "") or result.get("content", "")).strip()
+            if note:
+                self.target = note.splitlines()[0][:70]
+            self.update_header()
+            txt = Text(no_wrap=True)
+            if note:
+                for line in note.splitlines():
+                    txt.append(f"  {line}\n", style="#e6edf3")
+            else:
+                txt.append("  (empty note)\n", style="dim #8b949e")
+            self._safe_update_details(txt)
+            return
+
+        if is_err:
+            err_msg = str(result.get("error") or result.get("stderr") or "Tool execution failed.")
+            txt = Text(no_wrap=False)
+            txt.append("  [!!] Execution Failed:\n", style="bold #f85149")
+            if result.get("missing"):
+                txt.append(f"    Missing: {result['missing']}\n", style="bold #e6edf3")
+            if result.get("example"):
+                txt.append(f"    Example: {result['example']}\n", style="#58a6ff")
+            if self.target:
+                txt.append(f"    Target:  {self.target}\n", style="bold #e6edf3")
+            txt.append(f"    Reason:  {err_msg}\n", style="#ff7b72")
+            if result.get("stdout"):
+                txt.append("\n  ● Standard Output:\n", style="bold #8b949e")
+                for l in str(result["stdout"]).splitlines()[:20]:
+                    txt.append(f"    {l}\n", style="#8b949e")
+            if result.get("missing") and not self.target:
+                self.target = f"missing '{result['missing']}'"
+            self.update_header()
+            self._safe_update_details(txt)
+            try:
+                self.refresh(layout=True)
+                if self.app:
+                    self.app.refresh()
+            except Exception:
+                pass
+            return
+
+        if self.tool_name in ("edit", "write"):
+            import os
+            if not self.target or self.target.startswith("(in "):
+                p = result.get("path") or result.get("file") or result.get("target") or result.get("dest")
+                if p:
+                    self.target = str(p)
+            clean_tgt = self.target.split(" (")[0].strip()
+            content = result.get("content") or result.get("new_content") or result.get("code") or result.get("file_content")
+            if not content and clean_tgt:
+                try:
+                    if os.path.isfile(clean_tgt):
+                        with open(clean_tgt, "r", encoding="utf-8", errors="replace") as f:
+                            content = f.read()
+                except Exception:
+                    pass
+            if content is not None:
+                lines = content.splitlines()
+                if "(" not in self.target and self.target:
+                    self.target = f"{self.target} ({len(lines)} lines)"
+                    self.update_header()
+                lexer = get_lexer_for_path(clean_tgt)
+                try:
+                    from rich.syntax import Syntax
+                    syntax = Syntax(content, lexer, theme="github-dark", line_numbers=True, word_wrap=False)
+                    self._safe_update_details(syntax)
+                except Exception:
+                    txt = Text(no_wrap=True)
+                    for idx, line in enumerate(lines, 1):
+                        num_str = f"  {idx:>4}    "
+                        clean_l = str(line).replace("\t", "    ")
+                        txt.append(num_str, style="#484f58")
+                        txt.append(f"{clean_l}\n", style="#e6edf3")
+                    self._safe_update_details(txt)
+            else:
+                diff_entries = result.get("diff_entries", [])
+                if diff_entries:
+                    self._safe_update_details(render_edit_diff_opencode(diff_entries, target_file=self.target))
+                else:
+                    self._safe_update_details(Text(f"  {self.target}\n  (Code applied successfully)\n", style="#3fb950"))
+        elif self.tool_name.lower() in ("command", "shell", "bash", "terminal", "sh", "cmd", "run_command", "exec"):
+            stdout = result.get("stdout") or result.get("output") or result.get("result") or result.get("content") or ""
+            stderr = result.get("stderr") or ""
+            self._safe_update_details(render_command_output(str(stdout), str(stderr), cmd=self.target))
+        elif self.tool_name == "read" and "content" in result:
+            lines = str(result["content"]).splitlines()
+            if "(" not in self.target:
+                self.target = f"{self.target} ({len(lines)} lines)"
+                self.update_header()
+            start_l = 1
+            if "line_range" in result and "-" in str(result["line_range"]):
+                try:
+                    start_l = int(str(result["line_range"]).split("-")[0])
+                except Exception:
+                    start_l = 1
+            txt = Text(no_wrap=True)
+            for idx, l in enumerate(lines, start_l):
+                num_str = f"  {idx:>4}    "
+                clean_l = str(l).replace("\t", "    ")
+                txt.append(num_str, style="#484f58")
+                txt.append(f"{clean_l}\n", style="#e6edf3")
+            self._safe_update_details(txt)
+        elif self.tool_name.lower() in ("web", "fetch", "search_web", "webfetch"):
+            results = result.get("results", [])
+            txt = Text(no_wrap=True)
+            if results and isinstance(results, list):
+                if "(" not in self.target:
+                    self.target = f"{self.target} ({len(results)} results)"
+                    self.update_header()
+                import textwrap
+                for i, r in enumerate(results, 1):
+                    title = str(r.get("title", "Result")).strip()
+                    url = str(r.get("url", "")).strip()
+                    snippet = str(r.get("snippet", "")).strip()
+
+                    txt.append(f"  {i}. ", style="bold #58a6ff")
+                    txt.append(f"{title}\n", style="bold #e6edf3")
+
+                    if url:
+                        display_url = url if len(url) <= 85 else url[:82] + "..."
+                        txt.append(f"     {display_url}\n", style="dim #58a6ff")
+
+                    if snippet:
+                        wrapped_lines = textwrap.wrap(snippet, width=82)
+                        for line in wrapped_lines:
+                            txt.append(f"     {line}\n", style="#8b949e")
+
+                    if i < len(results):
+                        txt.append("\n")
+            elif "content" in result or "result" in result:
+                raw_c = str(result.get("content") or result.get("result") or "")
+                c_bytes = len(raw_c.encode("utf-8", errors="replace"))
+                c_words = len(raw_c.split())
+                c_kb = c_bytes / 1024.0
+                status_code = result.get("status_code", 200)
+                txt.append("  HTTP ", style="dim #8b949e")
+                txt.append(f"{status_code} OK", style="bold #7ee787" if status_code == 200 else "bold #f85149")
+                txt.append(f" · {c_kb:.1f} KB ({c_words} words)\n", style="#8b949e")
+                title = str(result.get("title") or "").strip()
+                if title:
+                    txt.append(f"  {title}\n", style="bold #e6edf3")
+            elif "error" in result:
+                txt.append(f"  Web error: {result['error']}\n", style="#f85149")
+            self._safe_update_details(txt)
+        elif self.tool_name in ("bugs", "tool_bugs"):
+            scanned = result.get("scanned_files", 0)
+            errors = result.get("errors", {})
+            txt = Text(no_wrap=False)
+            if not errors:
+                txt.append(f"  Syntax check passed: 0 errors across {scanned} files\n", style="#8b949e")
+            else:
+                txt.append(f"  Syntax errors in {len(errors)} file(s) (of {scanned} scanned):\n", style="bold #e6edf3")
+                for fpath, errs in errors.items():
+                    txt.append(f"    • {fpath}\n", style="#8b949e")
+                    for e in errs:
+                        txt.append(f"      {e}\n", style="#8b949e")
+            self._safe_update_details(txt)
+        elif self.tool_name in ("code_search", "codesearch", "symbol_search"):
+            symbols = result.get("symbols", [])
+            txt = Text(no_wrap=True)
+            if symbols:
+                if "(" not in self.target:
+                    self.target = f"{self.target} ({len(symbols)} symbols)"
+                    self.update_header()
+                for s in symbols:
+                    name = s.get("name", "")
+                    sig = s.get("signature", name)
+                    fp = s.get("filepath", "")
+                    line = s.get("start_line", 1)
+                    stype = s.get("symbol_type", "symbol")
+                    txt.append(f"  {fp}:{line} ", style="#58a6ff")
+                    txt.append(f"[{stype}] ", style="dim #8b949e")
+                    txt.append(f"{sig}\n", style="bold #e6edf3")
+            else:
+                txt.append(f"  No symbols found for query: {self.target}\n", style="dim #8b949e")
+            self._safe_update_details(txt)
+        elif self.tool_name == "screenshot":
+            txt = Text(no_wrap=True)
+            if result.get("path"):
+                if "(" not in self.target:
+                    self.target = f"{self.target} ({(result.get('size_bytes', 0) // 1024)} KB)"
+                    self.update_header()
+                txt.append(f"  {result['path']}\n", style="#e6edf3")
+                txt.append("  (open the file to view; call <tool:vision> to analyze it)\n", style="dim #8b949e")
+            else:
+                txt.append(f"  Screenshot failed: {result.get('error', 'unknown')}\n", style="#f85149")
+            self._safe_update_details(txt)
+        elif self.tool_name in ("vision", "mcp", "mcps"):
+            txt = Text(no_wrap=True)
+            if self.tool_name == "vision" and result.get("path"):
+                txt.append(f"  {result['path']}\n", style="#e6edf3")
+                if result.get("question"):
+                    txt.append(f"  question: {result['question']}\n", style="#8b949e")
+            else:
+                servers = result.get("servers") or []
+                opened = result.get("tools") or result.get("schema_text")
+                if opened:
+                    # `<tool:mcp open server="X" />` - the step that actually
+                    # yields something to look at. It carries no `servers` key,
+                    # and reading that absence as "no servers configured" said
+                    # the opposite of what the call had just done.
+                    names = result.get("tools") or []
+                    label = "tool" if len(names) == 1 else "tools"
+                    txt.append(f"  server: {self.target or result.get('server', '?')}\n",
+                               style="bold #e6edf3")
+                    txt.append(f"  {len(names)} {label} available\n", style="#8b949e")
+                    for n in names:
+                        txt.append(f"    {n}\n", style="#e6edf3")
+                    if result.get("error"):
+                        txt.append(f"  {result['error']}\n", style="#f85149")
+                elif not servers:
+                    # An empty list used to render nothing at all, so a broken
+                    # MCP setup looked identical to a tool that had not run.
+                    reason = result.get("note") or result.get("error") or "no servers configured"
+                    txt.append(f"  {reason}\n", style="#f85149")
+                else:
+                    for s in servers:
+                        if not isinstance(s, dict):
+                            txt.append(f"  {s}\n", style="#8b949e")
+                            continue
+                        name = str(s.get("name", "?"))
+                        # Connected servers are the useful case, so they read as
+                        # normal content. Anything else is a dead end for the
+                        # model and has to be impossible to miss.
+                        if s.get("connected"):
+                            count = int(s.get("tool_count", 0) or 0)
+                            label = f"{count} tool" if count == 1 else f"{count} tools"
+                            txt.append("  [ok] ", style="#3fb950")
+                            txt.append(f"{name}", style="bold #e6edf3")
+                            txt.append(f"  connected, {label}\n", style="#8b949e")
+                        elif not s.get("enabled"):
+                            txt.append("  [--] ", style="#f85149")
+                            txt.append(f"{name}", style="bold #f85149")
+                            txt.append("  not connected (switched off in /mcp)\n",
+                                       style="#f85149")
+                        else:
+                            # ASCII only: the Windows console defaults to
+                            # cp1250 and raises UnicodeEncodeError on a tick or
+                            # a cross before anything renders.
+                            txt.append("  [!!] ", style="#f85149")
+                            txt.append(f"{name}", style="bold #f85149")
+                            status = str(s.get("status") or "error")
+                            txt.append(f"  not connected ({status})\n", style="#f85149")
+                            why = str(s.get("reason") or "").strip()
+                            if why:
+                                txt.append(f"      {why}\n", style="dim #f85149")
+                if result.get("note") and servers:
+                    txt.append(f"  {result['note']}\n", style="dim #484f58")
+            self._safe_update_details(txt)
+        elif "content" not in result and ("text" in result or self.tool_name.startswith("mcp__")):
+            # A qualified MCP tool call returns `text` (see `_execute_mcp_tool`),
+            # not `content`. Only the `content` branches existed, so every real
+            # MCP tool call rendered as an empty card - the same blank-body
+            # symptom the listing had.
+            lines = str(result.get("text", "")).splitlines() or [""]
+            txt = Text(no_wrap=True)
+            for l in lines[:200]:
+                clean_l = str(l).replace("\t", "    ")
+                txt.append(f"    {clean_l}\n", style="#e6edf3")
+            if len(lines) > 200:
+                txt.append(f"    ... {len(lines) - 200} more lines\n", style="dim #8b949e")
+            self._safe_update_details(txt)
+        elif "content" in result or "result" in result or "output" in result or "stdout" in result:
+            val = result.get("content") or result.get("result") or result.get("output") or result.get("stdout") or ""
+            lines = str(val).splitlines()
+            txt = Text(no_wrap=True)
+            for l in lines:
+                clean_l = str(l).replace("\t", "    ")
+                txt.append(f"    {clean_l}\n", style="#e6edf3")
+            self._safe_update_details(txt)
+
+        elif "error" in result:
+            self._safe_update_details(Text(f"    Error: {result['error']}\n", style="#f85149"))
+        elif "entries" in result:
+            entries = result.get("entries", [])
+            dirs = [e for e in entries if e.get("type") == "dir"]
+            files = [e for e in entries if e.get("type") != "dir"]
+            all_items = dirs + files
+            total = len(all_items)
+            if "(" not in self.target:
+                self.target = f"{self.target} ({total} items)"
+                self.update_header()
+            txt = Text(no_wrap=True)
+            for idx, e in enumerate(all_items):
+                name = e.get("name", "")
+                if e.get("type") == "dir":
+                    txt.append(f"  {name}/\n", style="bold #58a6ff")
+                    children = e.get("children", [])
+                    for child in children:
+                        cname = child.get("name", "")
+                        c_is_dir = child.get("is_dir", False)
+                        txt.append(f"      {cname}\n", style="bold #58a6ff" if c_is_dir else "#8b949e")
+                else:
+                    txt.append(f"  {name}\n", style="#e6edf3")
+            self._safe_update_details(txt)
+        elif "matches" in result:
+            matches = result.get("matches", [])
+            if "(" not in self.target:
+                self.target = f"{self.target} ({len(matches)} matches)"
+                self.update_header()
+            txt = Text(no_wrap=True)
+            if not matches:
+                clean_tgt = self.target.split(" (")[0].strip()
+                txt.append(f"  No files matching: {clean_tgt}\n", style="dim #8b949e")
+            else:
+                for m in matches:
+                    txt.append(f"    {m}\n", style="#8b949e")
+            self._safe_update_details(txt)
+        elif "results" in result:
+            results = result.get("results", [])
+            if "(" not in self.target:
+                self.target = f"{self.target} ({len(results)} matches)"
+                self.update_header()
+            txt = Text(no_wrap=True)
+            if not results:
+                clean_tgt = self.target.split(" (")[0].strip()
+                txt.append(f"  No matches found for query: {clean_tgt}\n", style="dim #8b949e")
+            else:
+                by_file = {}
+                for r in results:
+                    f = r.get("file", "")
+                    by_file.setdefault(f, []).append(r)
+                for filename, matches in by_file.items():
+                    txt.append(f"  {filename} ", style="bold #58a6ff")
+                    txt.append(f"({len(matches)} matches)\n", style="#8b949e")
+                    for m in matches:
+                        line_num = m.get("line", "")
+                        content = m.get("content", "")
+                        clean_c = str(content).replace("\t", "    ")
+                        txt.append(f"    {line_num:>4}    ", style="#484f58")
+                        txt.append(f"{clean_c}\n", style="#e6edf3")
+            self._safe_update_details(txt)
+        elif self.tool_name in ("scratch", "todo", "tasks"):
+            txt = Text(no_wrap=True)
+            steps = result.get("visible_steps", [])
+            if steps:
+                for idx, s in enumerate(steps, 1):
+                    is_done = False
+                    if isinstance(s, dict):
+                        is_done = s.get("done", False)
+                        step_text = s.get("text", "")
+                    else:
+                        step_text = str(s)
+                        is_done = (idx == 1)
+
+                    if is_done:
+                        txt.append("  ●  ", style="bold #7ee787")
+                        txt.append(f"{step_text}\n", style="bold #e6edf3")
+                    else:
+                        txt.append("  ○  ", style="#8b949e")
+                        txt.append(f"{step_text}\n", style="#8b949e")
+            else:
+                note = result.get("note", self.target)
+                if note and note not in ("(TODO)", "plan", "test.py modification completed"):
+                    txt.append(f"  ●  {note}\n", style="bold #7ee787")
+                else:
+                    txt.append("  ●  Task completed successfully\n", style="bold #7ee787")
+            self._safe_update_details(txt)
+        elif self.tool_name.lower() in ("summarizing", "summarize", "compact", "context_compact"):
+            self.details_widget.styles.text_wrap = "wrap"
+            summary_content = (
+                result.get("summary")
+                or result.get("content")
+                or (result.get("result") if result.get("result") not in ("completed", "done", "ok") else "")
+                or self.summary_live_text
+                or self.target
+                or ""
+            )
+            if not str(summary_content).strip():
+                try:
+                    app_msgs = getattr(self.app, "messages", None) or []
+                    for m in app_msgs:
+                        mc = str(m.get("content", "") or "")
+                        if "CONTEXT COMPACTION" in mc.upper() or (m.get("role") == "assistant" and app_msgs.index(m) == 1 and len(app_msgs) <= 4):
+                            summary_content = mc
+                            break
+                except Exception:
+                    pass
+            clean_summary = str(summary_content).strip()
+            clean_summary = re.sub(r"^#+\s*CONTEXT COMPACTION STATE HANDOFF\s*", "", clean_summary, flags=re.IGNORECASE).strip()
+            clean_summary = re.sub(r"^●?\s*Context Compaction[^\n]*\n*", "", clean_summary, flags=re.IGNORECASE).strip()
+            clean_summary = re.sub(r"^●?\s*CONTEXT COMPACTION[^\n]*\n*", "", clean_summary, flags=re.IGNORECASE).strip()
+
+            if clean_summary:
+                try:
+                    self._safe_update_details(Markdown(clean_summary))
+                except Exception:
+                    self._safe_update_details(Text(clean_summary, style="#8b949e", no_wrap=False))
+            else:
+                self._safe_update_details(Text("Conversation history compacted.", style="dim #8b949e", no_wrap=False))
+
+        elif self.tool_name == "ask":
+            txt = Text()
+            qa_list = result.get("qa_list") or result.get("answers")
+            if qa_list and isinstance(qa_list, list):
+                for idx, qa in enumerate(qa_list, 1):
+                    q = qa.get("question", "")
+                    a = qa.get("answer", "")
+                    txt.append(f"  {idx}. {q}\n", style="bold #e6edf3")
+                    txt.append(f"     ↳ {a}\n", style="bold #7ee787")
+            else:
+                q = result.get("question", self.target)
+                ans = result.get("answer", "")
+                txt.append(f"  {q}\n", style="#e6edf3")
+                if ans:
+                    txt.append(f"  ↳  {ans}\n", style="bold #7ee787")
+            self._safe_update_details(txt)
+
+        is_sum_done = self.tool_name.lower() in ("summarizing", "summarize", "compact", "context_compact")
+        if is_sum_done:
+            self.update_header()
+            if self.is_expanded:
+                self.details_widget.styles.display = "block"
+        elif self.tool_name in ("scratch", "todo", "tasks") and self.is_tool_expandable():
+            self.set_expanded(True)
+        elif self.is_tool_expandable():
+            self.set_expanded(False)
+
+        try:
+            self.refresh(layout=True)
+            if self.app:
+                self.app.refresh()
+        except Exception:
+            pass
+
+    def set_expanded(self, expanded: bool) -> None:
+        if not self.is_tool_expandable():
+            return
+        self.is_expanded = expanded
+        if not expanded:
+            self.h_offset = 0
+            if self._original_details:
+                self._apply_horizontal_shift()
+        self.update_header()
+        # Never show an empty box when there are no details to display.
+        show = expanded and bool(self._original_details)
+        self.details_widget.styles.display = "block" if show else "none"
+        if show and self._original_details:
+            self._apply_horizontal_shift()
+
+    def on_click(self, event: events.Click) -> None:
+        tl = (getattr(self, "tool_name", "") or "").lower().strip()
+        if tl.startswith("tool:"):
+            tl = tl[5:].strip()
+        is_subagent = bool(getattr(self, "subagent_role", "")) or tl in ("subagent", "spawn_subagent", "task")
+        if is_subagent:
+            # Clicking a subagent ALWAYS opens the subagent chat view immediately,
+            # whether running in foreground, background, or completed!
+            event.stop()
+            event.prevent_default()
+            app = getattr(self, "app", None)
+            opener = getattr(app, "_open_subagent_chat", None)
+            if callable(opener):
+                try:
+                    opener(self)
+                except Exception as ex:
+                    if app and hasattr(app, "notify"):
+                        app.notify(f"Could not open subagent: {ex}", severity="error")
+            return
+
+        # Clicking the background shortcut hint sends non-subagent tasks to background
+        if getattr(event, "widget", None) == getattr(self, "bg_hint_widget", None):
+            app = getattr(self, "app", None)
+            if app and hasattr(app, "action_send_to_background"):
+                app.action_send_to_background()
+                return
+        if not self.is_tool_expandable():
+            return
+        if tl in ("summarizing", "summarize", "compact", "context_compact") or self.tool_running:
+            self.set_expanded(not self.is_expanded)
+            return
+        if self.tool_name == "screenshot" and self.result_data and self.result_data.get("path"):
+            import os as _os
+            import subprocess as _sp
+            p = self.result_data["path"]
+            try:
+                if _os.name == "nt":
+                    _os.startfile(p)
+                else:
+                    _sp.Popen(["xdg-open", p])
+                return
+            except Exception:
+                pass
+        w = getattr(event, "widget", None)
+        if w is not None:
+            if w == self.details_widget:
+                return
+            ancestors = getattr(w, "ancestors", [])
+            if self.details_widget in ancestors:
+                return
+        self.set_expanded(not self.is_expanded)
+
+
+class TodoPreviewBar(Static):
+    """TODO preview bar positioned directly above #input-card, showing max 3 items with scroll."""
+
+    DEFAULT_CSS = """
+    TodoPreviewBar {
+        width: 100%;
+        height: auto;
+        max-height: 6;
+        background: #161b22;
+        border: none;
+        border-bottom: solid #21262d;
+        padding: 0 2 0 2;
+        margin: 0;
+        scrollbar-size-vertical: 0;
+        scrollbar-size-horizontal: 0;
+    }
+    """
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("id", "todo-preview-bar")
+        super().__init__(**kwargs)
+        self.steps: List[Any] = []
+
+    def update_steps(self, steps: List[Any]) -> None:
+        self.steps = list(steps or [])
+        if not self.steps:
+            self.styles.display = "none"
+            self.update("")
+            try:
+                self.refresh(layout=True)
+            except Exception:
+                pass
+            return
+
+        self.remove_class("hidden")
+        self.styles.display = "block"
+        t = Text()
+        t.append("\n")
+        for idx, s in enumerate(self.steps, 1):
+            if isinstance(s, dict):
+                is_done = bool(s.get("done", False))
+                step_text = str(s.get("text", "") or "")
+            else:
+                step_text = str(s)
+                is_done = False
+
+            if is_done:
+                t.append("  ● ", style="bold #7ee787")
+                t.append(f"{step_text}", style="bold #e6edf3")
+            else:
+                t.append("  ○ ", style="#8b949e")
+                t.append(f"{step_text}", style="#8b949e")
+
+            if idx < len(self.steps):
+                t.append("\n")
+
+        self.update(t)
+        try:
+            self.refresh(layout=True)
+        except Exception:
+            pass

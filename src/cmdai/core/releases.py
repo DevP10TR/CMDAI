@@ -1,0 +1,440 @@
+import json
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+REPO = "DevP10TR/CMDAI"
+API_URL = f"https://api.github.com/repos/{REPO}/releases?per_page=50"
+MIN_TAG = (1, 0, 0, "")
+
+# The newest release is baked into the source so the app can always say what
+# changed, with no network. Managed by tools/gen_bundled_release.py: at every
+# release the old entry is replaced by the new one. Everything older is fetched
+# from GitHub at runtime, so this holds exactly one release, not a changelog.
+# --- BUNDLED_RELEASE_BEGIN (managed by tools/gen_bundled_release.py) ---
+BUNDLED_RELEASE = {
+    "tag": "v1.0.0",
+    "name": "CMDAI v1.0.0",
+    "published_at": "2026-11-15",
+    "url": "https://github.com/DevP10TR/CMDAI/releases/tag/v1.0.0",
+    "body": """# CMDAI v1.0.0 — Local AI Runtime, Ollama/OpenAI Server & CMDAI-CODE Controller
+
+Initial release of **CMDAI** (`https://github.com/DevP10TR/CMDAI`):
+
+* **Local GGUF Runtime & Ollama/OpenAI HTTP Server** (`cmdai serve`, `/server`, port `11434`)
+* **Hugging Face GGUF Hub & Quantization RAM-Fit Browser** (`/installmodels`, `/pull`, `cmdai pull`)
+* **Windows System Controller** (`<tool:system>` with safe permission gates)
+* **CMDAI-CODE Controller Bridge** (`/code`, `<tool:cmdai_code>`, `cmdai code`)""",
+}
+# --- BUNDLED_RELEASE_END ---
+
+
+def get_bundled_release() -> Dict[str, Any]:
+    """The release baked into the source, or {} when none is set yet."""
+    if not BUNDLED_RELEASE.get("tag"):
+        return {}
+    return dict(BUNDLED_RELEASE)
+
+
+def resolve_release_for_version(
+    version: str = "",
+    cached: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Return release notes matching `version` from cache before falling back to bundled."""
+    target_norm = (version or "").strip().lstrip("vV").lower()
+    pool = cached if cached is not None else load_cache()
+    if target_norm:
+        for entry in pool or []:
+            if not isinstance(entry, dict):
+                continue
+            tag_norm = str(entry.get("tag") or "").strip().lstrip("vV").lower()
+            if tag_norm == target_norm and str(entry.get("body") or "").strip():
+                return dict(entry)
+    bundled = get_bundled_release()
+    if target_norm and bundled:
+        b_norm = str(bundled.get("tag") or "").strip().lstrip("vV").lower()
+        if b_norm == target_norm:
+            return bundled
+    for entry in pool or []:
+        if not isinstance(entry, dict):
+            continue
+        tag_norm = str(entry.get("tag") or "").strip().lstrip("vV").lower()
+        if target_norm and tag_norm == target_norm:
+            return dict(entry)
+    if bundled:
+        return bundled
+    return resolve_newest(pool)
+
+
+def is_newer(tag_a: str, tag_b: str) -> bool:
+    """True when tag_a sorts strictly above tag_b.
+
+    Version tags never compare correctly as strings: v3.0.10 sorts below
+    v3.0.9. Everything that picks between two release candidates goes through
+    here rather than a bare comparison.
+    """
+    if not tag_a:
+        return False
+    if not tag_b:
+        return True
+    return _tag_sort_key(tag_a) > _tag_sort_key(tag_b)
+
+
+def resolve_newest(fetched: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    bundled = get_bundled_release()
+    newest_fetched = None
+    for r in (fetched or []):
+        if isinstance(r, dict) and r.get("tag"):
+            newest_fetched = r
+            break
+    if newest_fetched is not None:
+        # Fetched from GitHub wins if it is same version or newer
+        if not bundled or not is_newer(str(bundled.get("tag", "")), str(newest_fetched.get("tag", ""))):
+            return dict(newest_fetched)
+    return bundled if bundled else (dict(newest_fetched) if newest_fetched else {})
+
+
+def get_release_list(fetched: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+
+    # GitHub releases (or cache) come first and have precedence
+    for r in (fetched or []):
+        if not isinstance(r, dict):
+            continue
+        tag = str(r.get("tag", "")).strip()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        entry = dict(r)
+        entry["has_notes"] = bool(str(entry.get("body") or "").strip())
+        entry["bundled"] = False
+        entries.append(entry)
+
+    # Only fall back to bundled for tags not already fetched from GitHub
+    bundled = get_bundled_release()
+    if bundled and str(bundled.get("tag", "")).strip() not in seen:
+        entry = dict(bundled)
+        entry["has_notes"] = bool(str(entry.get("body") or "").strip())
+        entry["bundled"] = True
+        entries.append(entry)
+        seen.add(str(entry.get("tag", "")).strip())
+
+    entries.sort(key=lambda e: _tag_sort_key(str(e.get("tag", ""))), reverse=True)
+    return entries
+
+
+def offline_notice_text(tag: str = "") -> str:
+    """Shown when a release was listed but its notes are not on disk.
+
+    English on purpose: it is a diagnostic about the connection rather than
+    app content, and the other diagnostics in the changelog are English.
+    """
+    if tag:
+        return (f"Release notes for {tag} are not available offline. "
+                f"Connect to the internet and try again.")
+    return "Release notes are not available offline. Connect to the internet and try again."
+
+
+# --------------------------------------------------------------- update notice
+
+def notice_path() -> str:
+    """Where the "an update landed" note waits for the next launch."""
+    return os.path.join(_app_root(), "cache", "pending_changelog.json")
+
+
+def last_seen_path() -> str:
+    """The version this installation last started on."""
+    return os.path.join(_app_root(), "cache", "last_seen_version.json")
+
+
+def write_pending_notice(previous: str, version: str) -> bool:
+    """Record that an update moved the checkout from `previous` to `version`.
+
+    Stores only the version transition. The notes themselves come from
+    BUNDLED_RELEASE at display time, so the notice renders with no network -
+    which is the normal case, because a machine that just updated is often the
+    one that cannot reach GitHub.
+    """
+    try:
+        os.makedirs(os.path.dirname(notice_path()), exist_ok=True)
+        with open(notice_path(), "w", encoding="utf-8") as f:
+            json.dump({"previous": previous or "", "version": version or ""}, f)
+        return True
+    except Exception:
+        return False
+
+
+def read_pending_notice() -> Optional[Dict[str, str]]:
+    """The pending notice if there is one, else None. Never raises."""
+    try:
+        with open(notice_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not data.get("version"):
+            return None
+        return {"previous": str(data.get("previous", "")), "version": str(data["version"])}
+    except Exception:
+        return None
+
+
+def clear_pending_notice() -> None:
+    try:
+        os.remove(notice_path())
+    except OSError:
+        pass
+
+
+def read_last_seen_version() -> str:
+    try:
+        with open(last_seen_path(), "r", encoding="utf-8") as f:
+            return str(json.load(f).get("tag", "") or "")
+    except Exception:
+        return ""
+
+
+def mark_version_seen(tag: str) -> None:
+    try:
+        path = last_seen_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"tag": tag or ""}, f)
+    except Exception:
+        pass
+
+
+def detect_version_change(current: str) -> Optional[Dict[str, str]]:
+    """Notice the version moved, without nagging about anything else.
+
+    Returns {"previous", "version"} to show a notice, or None to stay quiet,
+    and records `current` either way so the next launch compares against it.
+
+    Quiet on a first run, and quiet on a downgrade. Both are normal: a fresh
+    clone has no history to report, and switching to an older tag or a feature
+    branch is not something the user needs a changelog popup about. Only a
+    move forward is worth interrupting them for.
+    """
+    current = (current or "").strip()
+    previous = read_last_seen_version()
+    if current:
+        # Only a resolved version carries information. Overwriting the baseline
+        # with "" would drop it on a launch where tags and the network are both
+        # unavailable, and the next real update would then have nothing to
+        # compare against.
+        mark_version_seen(current)
+    if not current or not previous or current == previous:
+        return None
+    if not is_newer(current, previous):
+        return None
+    return {"previous": previous, "version": current}
+
+
+def _app_root() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(os.path.dirname(here)))
+
+
+def _cache_path() -> str:
+    return os.path.join(_app_root(), "cache", "releases.json")
+
+
+def parse_tag(tag: str) -> Tuple[int, int, int, str]:
+    t = tag.strip().lstrip("vV")
+    m = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?(?:[-.]([A-Za-z0-9.]+))?", t)
+    if not m:
+        return (0, 0, 0, "")
+    major, minor = int(m.group(1)), int(m.group(2))
+    patch = int(m.group(3)) if m.group(3) is not None else 0
+    suffix = (m.group(4) or "").lower()
+    return (major, minor, patch, suffix)
+
+
+def _suffix_rank(suffix: str) -> int:
+    if not suffix or suffix.startswith("final") or suffix.startswith("stable"):
+        return 99
+    if "alpha" in suffix:
+        return 1
+    if "beta" in suffix:
+        return 2
+    if "rc" in suffix:
+        return 3
+    return 0
+
+
+def is_included(tag: str) -> bool:
+    major, minor, patch, suffix = parse_tag(tag)
+    mm, nn, pp, ss = MIN_TAG
+    if (major, minor, patch) < (mm, nn, pp):
+        return False
+    if (major, minor, patch) > (mm, nn, pp):
+        return True
+    return _suffix_rank(suffix) >= _suffix_rank(ss)
+
+
+def fetch_releases(timeout: float = 8.0) -> List[Dict[str, Any]]:
+    import requests
+
+    resp = requests.get(
+        API_URL,
+        headers={"User-Agent": "CMDAI", "Accept": "application/vnd.github+json"},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    out = []
+    for r in data if isinstance(data, list) else []:
+        tag = str(r.get("tag_name", ""))
+        if not tag or not is_included(tag):
+            continue
+        out.append(
+            {
+                "tag": tag,
+                "name": r.get("name") or tag,
+                "body": r.get("body") or "",
+                "published_at": (r.get("published_at") or "")[:10],
+                "prerelease": bool(r.get("prerelease")),
+                "url": r.get("html_url") or "",
+            }
+        )
+    # Newest first - the UI lists releases top-down.
+    out.sort(key=lambda x: _tag_sort_key(x["tag"]), reverse=True)
+    return out
+
+
+def save_cache(releases: List[Dict[str, Any]]) -> None:
+    try:
+        path = _cache_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(releases, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def load_cache() -> List[Dict[str, Any]]:
+    try:
+        with open(_cache_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return [r for r in data if is_included(str(r.get("tag", "")))]
+    except Exception:
+        return []
+
+
+def get_releases(refresh: bool = True) -> Tuple[List[Dict[str, Any]], str]:
+    if refresh:
+        try:
+            rels = fetch_releases()
+            save_cache(rels)
+            render_changelog_md(rels)
+            return rels, "github"
+        except Exception:
+            pass
+    cached = load_cache()
+    if cached:
+        return cached, "cache"
+    return [], "none"
+
+
+def _tag_sort_key(tag: str) -> Tuple[int, int, int, int, str]:
+    major, minor, patch, suffix = parse_tag(tag)
+    return (major, minor, patch, _suffix_rank(suffix), str(tag))
+
+
+def get_local_git_version(root: str = "") -> str:
+    """Newest local git tag (e.g. v1.0.0). Empty string when unavailable.
+
+    `root` overrides which checkout is inspected. Without it the root is derived
+    from this file's location, which is wrong whenever the caller is working on
+    a different checkout than the one holding the running code: the updater
+    pulls into its own app_root, so it has to report that directory's version
+    or it concludes nothing changed and never shows a notice.
+    """
+    import subprocess
+
+    try:
+        if not root:
+            here = os.path.dirname(os.path.abspath(__file__))
+            root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+        desc = subprocess.run(
+            ["git", "describe", "--tags", "--abbrev=0"],
+            cwd=root, text=True, capture_output=True, timeout=10,
+        )
+        candidates = []
+        if desc.returncode == 0 and (desc.stdout or "").strip():
+            candidates.append((desc.stdout or "").strip())
+        tags = subprocess.run(
+            ["git", "tag", "--list"],
+            cwd=root, text=True, capture_output=True, timeout=10,
+        )
+        if tags.returncode == 0:
+            candidates.extend(t.strip() for t in (tags.stdout or "").splitlines() if t.strip())
+        candidates = [c for c in candidates if is_included(c)]
+        if not candidates:
+            return ""
+        return sorted(candidates, key=_tag_sort_key)[-1].strip()
+    except Exception:
+        return ""
+
+
+def get_display_version(root: str = "") -> str:
+    candidates: List[str] = []
+    try:
+        cached = load_cache()
+        if cached:
+            cached_sorted = sorted(cached, key=lambda r: _tag_sort_key(str(r.get("tag", ""))))
+            tag = str(cached_sorted[-1].get("tag", "")).strip()
+            if tag:
+                candidates.append(tag)
+    except Exception:
+        pass
+    try:
+        local_tag = get_local_git_version(root)
+        if local_tag:
+            candidates.append(local_tag)
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(root or _app_root(), "config.json"), "r", encoding="utf-8") as f:
+            ver = str(json.load(f).get("version", "")).strip()
+            if ver:
+                candidates.append(ver)
+    except Exception:
+        pass
+    if not candidates:
+        try:
+            from .. import __version__
+            return f"v{__version__}" if not __version__.startswith("v") else __version__
+        except Exception:
+            return "v1.0.0" 
+    return sorted(candidates, key=_tag_sort_key)[-1].strip()
+
+
+def _generated_changelog_path() -> str:
+    """Where the rendered changelog goes.
+
+    Under cache/, never at the repo root. It used to overwrite the tracked
+    CHANGELOG.md on every successful fetch, so merely starting the app with a
+    network connection left the working tree dirty and the next
+    `cmdai code update` had local changes to reconcile.
+    """
+    return os.path.join(_app_root(), "cache", "CHANGELOG.md")
+
+
+def render_changelog_md(releases: List[Dict[str, Any]]) -> str:
+    lines = ["# CHANGELOG", "", "Generowane z GitHub Releases (>= v1.0.0).", ""]
+    for r in releases:
+        lines.append(f"## [{r['tag']}] - {r.get('published_at', '')}")
+        lines.append(f"### {r.get('name', '')}")
+        body = (r.get("body") or "").strip()
+        lines.append(body if body else "_Brak opisu._")
+        if r.get("url"):
+            lines.append(f"\n[{r['tag']}]({r['url']})")
+        lines.append("")
+    text = "\n".join(lines)
+    try:
+        path = _generated_changelog_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+    return text

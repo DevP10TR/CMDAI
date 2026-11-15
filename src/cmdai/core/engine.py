@@ -1,0 +1,307 @@
+import os
+import sys
+import threading
+import time
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
+
+try:
+    from llama_cpp import Llama, llama_log_set
+    import ctypes
+
+    def _null_log_callback(level, text, user_data):
+        pass
+
+    _C_LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)(_null_log_callback)
+    try:
+        llama_log_set(_C_LOG_CALLBACK, None)
+    except Exception:
+        pass
+except ImportError:
+    Llama = None
+
+
+import json
+import subprocess
+
+
+class SimpleGGUFLoader:
+
+    def __init__(self, models_dir: Optional[str] = None):
+        from .model_paths import resolve_models_dir
+        # One place decides where models live. This used to try six
+        # candidates, two of them hardcoded under a "CMDAI CODE" path that
+        # no longer exists, and fall back to the bare string "models".
+        self.models_dir = resolve_models_dir(models_dir or "")
+        self.current_model_path: Optional[str] = None
+        self.current_loader: Optional[str] = None
+        self.requested_loader: Optional[str] = None
+        self.current_n_ctx: int = 0
+        self.current_use_mmproj: bool = False
+        self.last_load_info: Dict[str, Any] = {}
+        self.last_load_warning: str = ""
+        self._is_loaded = False
+        self._proc: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+        self._stream_lock = threading.Lock()
+
+    @property
+    def llm(self) -> Optional[Any]:
+        return True if self._is_loaded else None
+
+    def _ensure_worker(self) -> bool:
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+
+        self._is_loaded = False
+        worker_script = os.path.join(os.path.dirname(__file__), "model_worker.py")
+        if not os.path.exists(worker_script):
+            return False
+
+        try:
+            flags = 0
+            if sys.platform == "win32":
+                flags = subprocess.CREATE_NO_WINDOW | 0x00004000
+
+            env = os.environ.copy()
+            src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            existing_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing_pp}" if existing_pp else src_dir
+
+            self._proc = subprocess.Popen(
+                [sys.executable, worker_script],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                creationflags=flags,
+                env=env,
+            )
+            return True
+        except Exception:
+            return False
+
+    def unload(self) -> None:
+        with self._lock:
+            if self._proc and self._proc.poll() is None:
+                try:
+                    self._proc.stdin.write(json.dumps({"action": "unload"}) + "\n")
+                    self._proc.stdin.flush()
+                    self._proc.stdout.readline()
+                except Exception:
+                    pass
+            self._is_loaded = False
+            self.current_model_path = None
+            self.current_loader = None
+            self.requested_loader = None
+            self.current_n_ctx = 0
+            self.last_load_info = {}
+            self.last_load_warning = ""
+
+    def close(self) -> None:
+        with self._lock:
+            if self._proc:
+                try:
+                    self._proc.stdin.write(json.dumps({"action": "exit"}) + "\n")
+                    self._proc.stdin.flush()
+                    self._proc.terminate()
+                except Exception:
+                    pass
+                self._proc = None
+            self._is_loaded = False
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        if not os.path.exists(self.models_dir):
+            return []
+        models = []
+        for filename in sorted(os.listdir(self.models_dir)):
+            if filename.endswith(".gguf"):
+                path = os.path.join(self.models_dir, filename)
+                size_mb = os.path.getsize(path) / (1024 * 1024)
+                models.append({
+                    "id": filename,
+                    "name": filename,
+                    "path": path,
+                    "size_mb": round(size_mb, 1),
+                })
+        return models
+
+    def load_model(
+        self,
+        model_filename: str,
+        n_ctx: int = 0,
+        n_gpu_layers: Optional[int] = None,
+        loader_type: Optional[str] = None,
+        use_mmproj: bool = False,
+    ) -> bool:
+        with self._lock:
+            from .settings import get_settings
+            loader = str(loader_type or get_settings().config.get("active_loader", "cpu") or "cpu").strip().lower()
+
+            if (
+                self._is_loaded
+                and self.current_model_path
+                and os.path.basename(self.current_model_path) == os.path.basename(model_filename)
+                and self.requested_loader == loader
+                and self.current_use_mmproj == bool(use_mmproj)
+                and self._proc is not None
+                and self._proc.poll() is None
+            ):
+                return True
+
+            if not self._ensure_worker():
+                return False
+
+            if not n_ctx or n_ctx <= 0:
+                try:
+                    from .resource_limits import get_dynamic_context_limit
+                    n_ctx = min(32768, get_dynamic_context_limit(model_filename, "local_gguf", models_dir=self.models_dir))
+                except Exception:
+                    n_ctx = 8192
+
+            req = {
+                "action": "load",
+                "model": model_filename,
+                "loader": loader,
+                "n_ctx": n_ctx or 8192,
+                "use_mmproj": bool(use_mmproj),
+            }
+            try:
+                self._proc.stdin.write(json.dumps(req) + "\n")
+                self._proc.stdin.flush()
+                resp_line = self._proc.stdout.readline()
+                if not resp_line:
+                    return False
+                res = json.loads(resp_line)
+                if res.get("status") == "ok":
+                    self._is_loaded = True
+                    self.current_model_path = model_filename
+                    self.requested_loader = loader
+                    self.current_loader = res.get("loader") or loader
+                    self.current_n_ctx = int(res.get("n_ctx") or req["n_ctx"])
+                    self.current_use_mmproj = bool(use_mmproj)
+                    self.last_load_info = res
+                    self.last_load_warning = str(res.get("warning") or "")
+                    return True
+                return False
+            except Exception:
+                return False
+
+    def stream_chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.6,
+        max_tokens: int = 2048,
+        on_token: Optional[Callable[[str], None]] = None,
+        on_thinking: Optional[Callable[[str], None]] = None,
+        model_filename: Optional[str] = None,
+        is_aborted: Optional[Callable[[], bool]] = None,
+        on_usage: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Tuple[str, str]:
+        with self._stream_lock:
+            from .settings import get_settings
+            desired_loader = str(get_settings().config.get("active_loader", "cpu") or "cpu").strip().lower()
+            model_changed = bool(
+                model_filename
+                and self.current_model_path
+                and os.path.basename(self.current_model_path) != os.path.basename(model_filename)
+            )
+            needs_vision = any(
+                isinstance(m, dict) and isinstance(m.get("content"), list)
+                for m in (messages or [])
+            )
+            loader_changed = bool(self.requested_loader and self.requested_loader != desired_loader)
+            mmproj_changed = bool(self.current_use_mmproj != needs_vision)
+            if not self._is_loaded or model_changed or loader_changed or mmproj_changed:
+                target = model_filename or self.current_model_path or "gemma-4-E4B-it-Q4_0.gguf"
+                ok = self.load_model(target, loader_type=desired_loader, use_mmproj=needs_vision)
+                if not ok:
+                    err = f"Failed to load model: {target}"
+                    if on_token:
+                        on_token(err)
+                    return err, ""
+
+            if not self._ensure_worker():
+                err = "Model worker process unavailable."
+                if on_token:
+                    on_token(err)
+                return err, ""
+
+            req = {
+                "action": "chat",
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+
+            try:
+                self._proc.stdin.write(json.dumps(req) + "\n")
+                self._proc.stdin.flush()
+            except Exception as e:
+                err = f"Worker communication error: {e}"
+                if on_token:
+                    on_token(err)
+                return err, ""
+
+            abort_stopped = threading.Event()
+
+            def _monitor_abort():
+                while not abort_stopped.is_set():
+                    if is_aborted and is_aborted():
+                        try:
+                            self._proc.stdin.write(json.dumps({"action": "abort"}) + "\n")
+                            self._proc.stdin.flush()
+                        except Exception:
+                            pass
+                        break
+                    time.sleep(0.04)
+
+            abort_thread = threading.Thread(target=_monitor_abort, daemon=True)
+            abort_thread.start()
+
+            full_text: List[str] = []
+            full_thinking: List[str] = []
+
+            try:
+                while True:
+                    line = self._proc.stdout.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except Exception:
+                        continue
+
+                    mtype = msg.get("type")
+                    if mtype == "token":
+                        content = msg.get("content", "")
+                        full_text.append(content)
+                        if on_token:
+                            on_token(content)
+                    elif mtype == "thinking":
+                        content = msg.get("content", "")
+                        full_thinking.append(content)
+                        if on_thinking:
+                            on_thinking(content)
+                    elif mtype == "done":
+                        resp = msg.get("response", "".join(full_text))
+                        think = msg.get("thinking", "".join(full_thinking))
+                        usage = msg.get("usage", {})
+                        if on_usage and usage:
+                            try:
+                                on_usage(usage)
+                            except Exception:
+                                pass
+                        return resp, think
+                    elif mtype == "error":
+                        err = msg.get("error", "Generation error")
+                        if on_token:
+                            on_token(f"\n[Error: {err}]")
+                        return err, ""
+            finally:
+                abort_stopped.set()
+
+            return "".join(full_text), "".join(full_thinking)
+

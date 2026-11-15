@@ -1,0 +1,1315 @@
+import json
+import os
+import re
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
+
+try:
+    import requests
+except ImportError:
+    requests = None
+from .capabilities import (
+    THINKING_OFF,
+    budget_for,
+    clamp_effort,
+    effort_budget_field,
+    get_model_capability,
+    normalize_level,
+    note_reasoning_observed,
+)
+
+TOOL_COMPLETE_PATTERNS = re.compile(
+    r'(?:'
+    r'<tool:(?!write\b|edit\b|command\b)\w+[^>]*?/>'
+    r'|<tool:(?:write|edit|command)\b[^>]*?\b(?:content|code|new|cmd|command)=[^>]*?/>'
+    r'|</tool:\w+\s*>'
+    r'|</(?:subagent|task)>'
+    r'|<tool_call>[^>]*?/>'
+    r'|</tool_call>'
+    r'|<\|tool_call>[^>]*?/>'
+    r'|<tool:(?:ls|read|glob|search|grep|code_search|bugs)\s+[^>]*=[^>]*>'
+    r')',
+    re.IGNORECASE
+)
+
+HALLUCINATED_TURN_STOP_RE = re.compile(
+    r'(?:^|\n)\s*(?:</?ASSISTANT\s*>|<USER\s*>(?=\s*(?:\n|<tool_response\b))|<tool_response(?:\s+name=[^>]*)?>)',
+    re.IGNORECASE,
+)
+
+
+def is_stream_tool_or_turn_complete(text: str) -> bool:
+    """True when streamed model output completed a tool tag or hallucinated a turn break."""
+    if not text:
+        return False
+    return bool(TOOL_COMPLETE_PATTERNS.search(text) or HALLUCINATED_TURN_STOP_RE.search(text))
+
+
+@dataclass
+class ProviderInfo:
+    id: str
+    name: str
+    base_url: str
+    key_url: str
+    provider_type: str
+    default_models: List[str] = field(default_factory=list)
+    supports_remote_fetch: bool = True
+    models_endpoint: str = "/models"
+    needs_custom_auth: bool = False
+    auth_hint: str = ""
+
+
+def resolve_provider_base_url(provider_id: str, default_url: str = "") -> str:
+    """Resolve base URL honoring env vars and user-configured provider_urls."""
+    url = str(default_url or "").strip().rstrip("/")
+    try:
+        from .settings import get_settings
+        url = get_settings().get_provider_base_url(provider_id, default_url)
+    except Exception:
+        pass
+    if provider_id == "localllmapi" and url:
+        # Allow entering either http://host:1000 or http://host:1000/v1
+        if not url.endswith("/v1") and url.count("/") <= 2:
+            url = f"{url}/v1"
+    return url.rstrip("/")
+
+
+PROVIDERS_CATALOG: Dict[str, ProviderInfo] = {
+    "local_gguf": ProviderInfo(
+        id="local_gguf",
+        name="Local GGUF (Vulkan/CPU)",
+        base_url="local://models",
+        key_url="",
+        provider_type="local",
+        default_models=[],
+        supports_remote_fetch=True,
+    ),
+    "localllmapi": ProviderInfo(
+        id="localllmapi",
+        name="LocalLLMAPI (API Server)",
+        base_url="http://127.0.0.1:1000/v1",
+        key_url="http://127.0.0.1:1000",
+        provider_type="cloud",
+        default_models=[],
+        supports_remote_fetch=True,
+        models_endpoint="/models",
+    ),
+    "opencode": ProviderInfo(
+        id="opencode",
+        name="OpenCode Zen",
+        base_url="https://opencode.ai/zen/v1",
+        key_url="https://opencode.ai/zen",
+        provider_type="cloud",
+        default_models=[
+            "deepseek-v4-flash-free",
+            "mimo-v2.5-free",
+            "nemotron-3-ultra-free",
+            "nemotron-3.5-lightning-free",
+            "ling-3.0-flash-fin-free",
+            "jev-1.13-free",
+            "muse-spark-1.3-contributor-free",
+            "qwen3.6-plus-free",
+            "minimax-m3-free",
+            "big-pickle",
+            "claude-3-7-sonnet",
+            "gpt-4o",
+        ],
+        supports_remote_fetch=True,
+    ),
+    "openrouter": ProviderInfo(
+        id="openrouter",
+        name="OpenRouter",
+        base_url="https://openrouter.ai/api/v1",
+        key_url="https://openrouter.ai/keys",
+        provider_type="cloud",
+        default_models=[
+            "google/gemini-2.0-flash-exp:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "deepseek/deepseek-r1:free",
+            "qwen/qwen-2.5-coder-32b-instruct:free",
+            "mistralai/mistral-7b-instruct:free",
+            "anthropic/claude-3.7-sonnet",
+            "openai/o3-mini",
+        ],
+    ),
+    "openai": ProviderInfo(
+        id="openai",
+        name="OpenAI",
+        base_url="https://api.openai.com/v1",
+        key_url="https://platform.openai.com/api-keys",
+        provider_type="cloud",
+        default_models=[
+            "o3-mini",
+            "o1",
+            "gpt-4o",
+            "gpt-4o-mini",
+        ],
+    ),
+    "anthropic": ProviderInfo(
+        id="anthropic",
+        name="Anthropic",
+        base_url="https://api.anthropic.com/v1",
+        key_url="https://console.anthropic.com/settings/keys",
+        provider_type="cloud",
+        default_models=[
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-5-haiku-20241022",
+        ],
+        supports_remote_fetch=False,
+    ),
+    "gemini": ProviderInfo(
+        id="gemini",
+        name="Google Gemini",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        key_url="https://aistudio.google.com/app/apikey",
+        provider_type="cloud",
+        default_models=[
+            "gemini-2.0-flash",
+            "gemini-2.0-pro-exp-02-05",
+            "gemini-1.5-pro",
+        ],
+    ),
+    "deepseek": ProviderInfo(
+        id="deepseek",
+        name="DeepSeek",
+        base_url="https://api.deepseek.com/v1",
+        key_url="https://platform.deepseek.com/api_keys",
+        provider_type="cloud",
+        default_models=[
+            "deepseek-reasoner",
+            "deepseek-chat",
+        ],
+    ),
+    "groq": ProviderInfo(
+        id="groq",
+        name="Groq LPU",
+        base_url="https://api.groq.com/openai/v1",
+        key_url="https://console.groq.com/keys",
+        provider_type="fast_inference",
+        default_models=[
+            "llama-3.3-70b-versatile",
+            "deepseek-r1-distill-llama-70b",
+            "llama-3.1-8b-instant",
+        ],
+    ),
+    "cerebras": ProviderInfo(
+        id="cerebras",
+        name="Cerebras",
+        base_url="https://api.cerebras.ai/v1",
+        key_url="https://cloud.cerebras.ai",
+        provider_type="fast_inference",
+        default_models=[
+            "llama3.3-70b",
+            "llama3.1-8b",
+        ],
+    ),
+    "xai": ProviderInfo(
+        id="xai",
+        name="xAI (Grok)",
+        base_url="https://api.x.ai/v1",
+        key_url="https://console.x.ai/",
+        provider_type="cloud",
+        default_models=[
+            "grok-2-1212",
+            "grok-2-vision-1212",
+        ],
+    ),
+    "mistral": ProviderInfo(
+        id="mistral",
+        name="Mistral AI",
+        base_url="https://api.mistral.ai/v1",
+        key_url="https://console.mistral.ai/api-keys/",
+        provider_type="cloud",
+        default_models=[
+            "mistral-large-latest",
+            "codestral-latest",
+            "ministral-8b-latest",
+        ],
+    ),
+    "together": ProviderInfo(
+        id="together",
+        name="Together AI",
+        base_url="https://api.together.xyz/v1",
+        key_url="https://api.together.ai/settings/api-keys",
+        provider_type="fast_inference",
+        default_models=[
+            "deepseek-ai/DeepSeek-R1",
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "Qwen/Qwen2.5-Coder-32B-Instruct",
+        ],
+    ),
+    "perplexity": ProviderInfo(
+        id="perplexity",
+        name="Perplexity AI",
+        base_url="https://api.perplexity.ai",
+        key_url="https://www.perplexity.ai/settings/api",
+        provider_type="cloud",
+        default_models=[
+            "sonar-pro",
+            "sonar",
+            "sonar-reasoning",
+        ],
+    ),
+    "cohere": ProviderInfo(
+        id="cohere",
+        name="Cohere",
+        base_url="https://api.cohere.com/v2",
+        key_url="https://dashboard.cohere.com/api-keys",
+        provider_type="cloud",
+        default_models=[
+            "command-r-plus-08-2024",
+            "command-r-08-2024",
+        ],
+    ),
+    "fireworks": ProviderInfo(
+        id="fireworks",
+        name="Fireworks AI",
+        base_url="https://api.fireworks.ai/inference/v1",
+        key_url="https://fireworks.ai/api-keys",
+        provider_type="fast_inference",
+        default_models=[
+            "accounts/fireworks/models/deepseek-r1",
+            "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        ],
+    ),
+    "sambanova": ProviderInfo(
+        id="sambanova",
+        name="SambaNova Systems",
+        base_url="https://api.sambanova.ai/v1",
+        key_url="https://cloud.sambanova.ai/apis",
+        provider_type="fast_inference",
+        default_models=[
+            "Meta-Llama-3.3-70B-Instruct",
+            "DeepSeek-R1-Distill-Llama-70B",
+        ],
+    ),
+    "ai21": ProviderInfo(
+        id="ai21",
+        name="AI21 Labs",
+        base_url="https://api.ai21.com/studio/v1",
+        key_url="https://studio.ai21.com/account/api-key",
+        provider_type="cloud",
+        default_models=[
+            "jamba-1.5-large",
+            "jamba-1.5-mini",
+        ],
+    ),
+    "deepinfra": ProviderInfo(
+        id="deepinfra",
+        name="DeepInfra",
+        base_url="https://api.deepinfra.com/v1/openai",
+        key_url="https://deepinfra.com/dash/api_keys",
+        provider_type="fast_inference",
+        default_models=[
+            "deepseek-ai/DeepSeek-R1",
+            "meta-llama/Meta-Llama-3.3-70B-Instruct",
+        ],
+    ),
+    "replicate": ProviderInfo(
+        id="replicate",
+        name="Replicate",
+        base_url="https://api.replicate.com/v1",
+        key_url="https://replicate.com/account/api-tokens",
+        provider_type="cloud",
+        default_models=[
+            "meta/meta-llama-3.3-70b-instruct",
+            "deepseek-ai/deepseek-r1",
+        ],
+    ),
+    "cloudflare": ProviderInfo(
+        id="cloudflare",
+        name="Cloudflare Workers AI",
+        base_url="https://api.cloudflare.com/client/v4/accounts",
+        key_url="https://dash.cloudflare.com/profile/api-tokens",
+        provider_type="cloud",
+        default_models=[
+            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+        ],
+    ),
+    "huggingface": ProviderInfo(
+        id="huggingface",
+        name="Hugging Face Inference",
+        base_url="https://api-inference.huggingface.co/v1",
+        key_url="https://huggingface.co/settings/tokens",
+        provider_type="cloud",
+        default_models=[],
+        supports_remote_fetch=False,
+    ),
+    "ollama": ProviderInfo(
+        id="ollama",
+        name="Ollama (Local)",
+        base_url="http://localhost:11434",
+        key_url="https://ollama.com",
+        provider_type="local",
+        default_models=[],
+        models_endpoint="/api/tags",
+    ),
+    "lmstudio": ProviderInfo(
+        id="lmstudio",
+        name="LM Studio (Local)",
+        base_url="http://localhost:1234/v1",
+        key_url="https://lmstudio.ai",
+        provider_type="local",
+        default_models=[],
+    ),
+    "vllm": ProviderInfo(
+        id="vllm",
+        name="vLLM Server",
+        base_url="http://localhost:8000/v1",
+        key_url="",
+        provider_type="local",
+        default_models=[],
+    ),
+    "zai": ProviderInfo(
+        id="zai",
+        name="Z.AI (Zhipu)",
+        base_url="https://api.z.ai/api/paas/v4",
+        key_url="https://z.ai/manage-apikey/apikey-list",
+        provider_type="cloud",
+        default_models=[
+            "glm-4.6",
+            "glm-4.5",
+            "glm-4.5-air",
+        ],
+    ),
+    "github_models": ProviderInfo(
+        id="github_models",
+        name="GitHub Models",
+        base_url="https://models.github.ai/inference",
+        key_url="https://github.com/settings/tokens",
+        provider_type="cloud",
+        default_models=[
+            "openai/gpt-4o",
+            "openai/gpt-4o-mini",
+            "meta/Llama-3.3-70B-Instruct",
+            "deepseek/DeepSeek-R1",
+        ],
+    ),
+    "moonshot": ProviderInfo(
+        id="moonshot",
+        name="Moonshot AI",
+        base_url="https://api.moonshot.ai/v1",
+        key_url="https://platform.moonshot.ai/console/api-keys",
+        provider_type="cloud",
+        default_models=[
+            "kimi-k2-0711-preview",
+            "moonshot-v1-8k",
+            "moonshot-v1-32k",
+        ],
+    ),
+    "nvidia": ProviderInfo(
+        id="nvidia",
+        name="NVIDIA NIM",
+        base_url="https://integrate.api.nvidia.com/v1",
+        key_url="https://build.nvidia.com",
+        provider_type="cloud",
+        default_models=[
+            "meta/llama-3.3-70b-instruct",
+            "deepseek-ai/deepseek-r1",
+            "qwen/qwen2.5-coder-32b-instruct",
+        ],
+    ),
+    "nebius": ProviderInfo(
+        id="nebius",
+        name="Nebius AI Studio",
+        base_url="https://api.studio.nebius.com/v1",
+        key_url="https://studio.nebius.com/settings/api-keys",
+        provider_type="cloud",
+        default_models=[
+            "meta-llama/Meta-Llama-3.3-70B-Instruct",
+            "deepseek-ai/DeepSeek-R1",
+            "Qwen/Qwen2.5-Coder-32B-Instruct",
+        ],
+    ),
+    "minimax": ProviderInfo(
+        id="minimax",
+        name="MiniMax",
+        base_url="https://api.minimax.io/v1",
+        key_url="https://platform.minimax.io",
+        provider_type="cloud",
+        default_models=[
+            "MiniMax-M2",
+            "MiniMax-Text-01",
+        ],
+    ),
+    "bedrock": ProviderInfo(
+        id="bedrock",
+        name="AWS Bedrock",
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+        key_url="https://console.aws.amazon.com/bedrock",
+        provider_type="cloud",
+        default_models=[
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "meta.llama3-3-70b-instruct-v1:0",
+        ],
+        supports_remote_fetch=False,
+        needs_custom_auth=True,
+        auth_hint="Bedrock uses AWS SigV4 signing, not a Bearer key. Configure AWS credentials (aws configure) and use an AWS SDK proxy or the 'aws bedrock-runtime' CLI.",
+    ),
+    "vertex": ProviderInfo(
+        id="vertex",
+        name="Google Vertex AI",
+        base_url="https://us-central1-aiplatform.googleapis.com",
+        key_url="https://console.cloud.google.com/vertex-ai",
+        provider_type="cloud",
+        default_models=[
+            "gemini-2.0-flash-001",
+            "claude-3-7-sonnet@20250219",
+        ],
+        supports_remote_fetch=False,
+        needs_custom_auth=True,
+        auth_hint="Vertex AI needs a GCP access token (gcloud auth print-access-token), not a plain API key. Use the Gemini provider entry for key-based access.",
+    ),
+    "copilot": ProviderInfo(
+        id="copilot",
+        name="GitHub Copilot",
+        base_url="https://api.githubcopilot.com",
+        key_url="https://github.com/settings/copilot",
+        provider_type="cloud",
+        default_models=[
+            "gpt-4o",
+            "claude-3.7-sonnet",
+        ],
+        supports_remote_fetch=False,
+        needs_custom_auth=True,
+        auth_hint="Copilot needs a GitHub OAuth device-flow token, not a classic PAT. Sign in via the official Copilot CLI/extension to obtain one.",
+    ),
+}
+
+
+def catalog_models(provider_id: str) -> List[Dict[str, Any]]:
+    """Every model models.dev lists for this provider.
+
+    For the providers whose own `/models` returns a bare `id` - or returns
+    nothing at all, as `anthropic` does with `supports_remote_fetch=False` -
+    this is the only list there is. It says what exists; the provider's own
+    endpoint says what *this account* may reach, and the two are not the same
+    question.
+    """
+    try:
+        from . import model_catalog as MC
+    except Exception:
+        return []
+
+    their_id = MC.catalog_provider_id(provider_id)
+    if not their_id:
+        return []
+    provider = MC.load().get(their_id)
+    if not isinstance(provider, dict):
+        return []
+    models = provider.get("models")
+    if not isinstance(models, dict):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for model_id in models:
+        cap = get_model_capability(model_id, provider_id=provider_id)
+        badge = []
+        if cap.thinking:
+            badge.append("reasoning")
+        out.append({
+            "id": model_id,
+            "name": model_id,
+            "badge": " · ".join(badge),
+            "thinking": cap.thinking,
+            "levels": list(cap.levels),
+            "param_style": cap.param_style,
+            "from_catalog": True,
+        })
+    out.sort(key=lambda m: (0 if m["thinking"] else 1, str(m["id"]).lower()))
+    return out
+
+
+def has_reasoning(provider_id: str, model_id: str) -> Optional[bool]:
+    """Whether a model reasons, or None when nobody will say.
+
+    None is the load-bearing value. Roughly 26 providers publish nothing about
+    reasoning, and reporting False for those would be a confident wrong answer
+    where the honest one is "unknown" - which is how a model that thinks on
+    most turns ends up with no thinking level and no label.
+    """
+    cap = get_model_capability(model_id, provider_id=provider_id)
+    if cap.source == "name_heuristic":
+        return None
+    return bool(cap.thinking)
+
+
+def _merge_catalog_facts(provider_id: str, models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Attach what models.dev knows to a list the provider just returned.
+
+    The provider decides which models exist for this account. models.dev decides
+    what each one can do. Neither overrides the other: a model the provider did
+    not list stays off the list, and a model it did list is never dropped for
+    being unknown to the catalogue.
+    """
+    if not models:
+        return models
+    out = []
+    for m in models:
+        mid = str(m.get("id") or m.get("name") or "")
+        if not mid:
+            continue
+        entry = dict(m)
+        cap = get_model_capability(mid, provider_id=provider_id)
+        entry["thinking"] = bool(cap.thinking)
+        entry["levels"] = list(cap.levels)
+        entry["param_style"] = cap.param_style
+        if cap.vision:
+            entry["vision"] = True
+        if not m.get("badge") or "reasoning" not in str(m.get("badge")):
+            badge = str(m.get("badge") or "")
+            entry["badge"] = (badge + " · reasoning") if badge else "reasoning"
+        out.append(entry)
+    return out
+
+
+def fetch_remote_models(provider_id: str, api_key: str = "") -> List[Dict[str, Any]]:
+    if provider_id == "opencode_zen":
+        provider_id = "opencode"
+    if provider_id in ("opencode_local", "local_opencode"):
+        provider_id = "local_gguf"
+    info = PROVIDERS_CATALOG.get(provider_id)
+    if not info:
+        return []
+
+    if provider_id in ("local_gguf", "opencode_local", "local_opencode"):
+        from .model_paths import list_gguf_files, resolve_models_dir
+        models_dir = resolve_models_dir("")
+        if not os.path.isdir(models_dir):
+            return []
+
+        found = []
+        for f in sorted(os.listdir(models_dir)):
+            if f.endswith(".gguf"):
+                path = os.path.join(models_dir, f)
+                size_mb = os.path.getsize(path) / (1024 * 1024)
+                size_str = f"{size_mb / 1024:.1f}GB" if size_mb > 1024 else f"{size_mb:.0f}MB"
+                f_low = f.lower()
+                has_think = any(k in f_low for k in ["r1", "qwq", "reason", "think", "deepseek"])
+                found.append({
+                    "id": f,
+                    "name": f,
+                    "badge": size_str,
+                    "thinking": has_think,
+                    "levels": ["low", "medium", "high"] if has_think else [],
+                })
+        return found
+
+    is_custom_prov = False
+    try:
+        from .settings import get_settings
+        is_custom_prov = provider_id in get_settings().get_custom_providers()
+    except Exception:
+        is_custom_prov = False
+
+    if not api_key and not is_custom_prov and provider_id not in ("openrouter", "opencode", "opencode_zen", "ollama", "lmstudio", "vllm", "local_gguf", "localllmapi"):
+        # No key, so the provider will not tell us anything. The catalogue still
+        # can, and a card with a real list beats a card that says "key required"
+        # while the list is sitting there.
+        return catalog_models(provider_id)
+
+    if requests is None:
+        return catalog_models(provider_id)
+
+    base_url = resolve_provider_base_url(provider_id, info.base_url)
+    url = f"{base_url}{info.models_endpoint}"
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "CMDAI/1.0",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["x-api-key"] = api_key
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=6.0)
+        if resp.status_code == 404 and not base_url.endswith("/v1") and info.models_endpoint == "/models":
+            resp = requests.get(f"{base_url}/v1{info.models_endpoint}", headers=headers, timeout=6.0)
+        if resp.status_code == 200:
+            data = resp.json()
+
+            if "models" in data and isinstance(data["models"], list):
+                # Ollama. The template is not in this response - it comes from
+                # /api/show per model - so nothing here may be read as an answer
+                # about reasoning. Was `"<think>" in template` against a field
+                # this endpoint does not return, which is why it always fell
+                # through to the model name.
+                listed = [
+                    {
+                        "id": m.get("name", m.get("model", "")),
+                        "name": m.get("name", m.get("model", "")),
+                        "badge": f"{(m.get('size', 0) / (1024**3)):.1f}GB" if m.get("size") else "ollama",
+                    }
+                    for m in data["models"]
+                ]
+                return _merge_catalog_facts(provider_id, listed)
+
+            if "data" in data and isinstance(data["data"], list):
+                raw_models = data["data"]
+
+                if provider_id == "openrouter":
+                    raw_models.sort(key=lambda x: x.get("created", 0), reverse=True)
+
+                res = []
+                for item in raw_models:
+                    if not isinstance(item, dict):
+                        continue
+                    mid = item.get("id", "")
+                    if not mid:
+                        continue
+                    name = item.get("name", mid)
+
+                    from .resource_limits import extract_model_context_length, record_live_context_limit
+                    existing_cap = get_model_capability(mid, provider_id=provider_id)
+                    ctx_len = extract_model_context_length(item)
+                    if ctx_len <= 0 and getattr(existing_cap, "context_limit", 0) > 0:
+                        ctx_len = int(existing_cap.context_limit)
+
+                    # The provider's own answer first. `supported_parameters`
+                    # naming `reasoning` is better than anything we could look
+                    # up. The name keywords that used to close this expression
+                    # are gone: they were a guess dressed as a check, they missed
+                    # `gemini` and `qwen3`, and they were the reason a card and
+                    # the input bar could disagree about the same model.
+                    params = item.get("supported_parameters", [])
+                    reported = (
+                        "reasoning" in params
+                        or "include_reasoning" in params
+                        or bool(item.get("reasoning"))
+                    )
+                    from .capabilities import extract_vision_from_payload, register_model_capability
+                    vis_flag = extract_vision_from_payload(item)
+                    if reported or vis_flag is not None or (provider_id == "localllmapi" and ctx_len > 0):
+                        register_model_capability(
+                            mid,
+                            provider_id=provider_id,
+                            thinking=reported if (reported or provider_id != "localllmapi") else existing_cap.thinking,
+                            param_style=("reasoning_effort" if reported else existing_cap.param_style),
+                            vision=vis_flag,
+                            context_limit=ctx_len,
+                        )
+                    cap = get_model_capability(mid, provider_id=provider_id)
+
+                    ctx_str = ""
+                    if ctx_len >= 1_000_000:
+                        ctx_str = f"{ctx_len // 1_000_000}M"
+                    elif ctx_len >= 1_000:
+                        ctx_str = f"{ctx_len // 1_000}k"
+
+                    is_free = "free" in mid.lower() or ":free" in mid.lower() or "free" in name.lower()
+                    badge_parts = []
+                    if is_free:
+                        badge_parts.append("FREE")
+                    if ctx_str:
+                        badge_parts.append(ctx_str)
+                    if provider_id == "localllmapi" and item.get("engine"):
+                        badge_parts.append(str(item["engine"]).upper())
+                    if cap.thinking:
+                        badge_parts.append("reasoning")
+
+                    if ctx_len > 0:
+                        if provider_id == "localllmapi":
+                            record_live_context_limit(provider_id, mid, ctx_len)
+                        else:
+                            from .resource_limits import save_model_metadata
+                            save_model_metadata(mid, provider_id, ctx_len)
+
+                    res.append({
+                        "id": mid,
+                        "name": name,
+                        "badge": " · ".join(badge_parts) if badge_parts else "",
+                        "thinking": cap.thinking,
+                        "levels": list(cap.levels),
+                        "param_style": cap.param_style,
+                        "context_length": ctx_len,
+                    })
+
+                def _is_free_item(m_item: Dict[str, Any]) -> bool:
+                    m_id = str(m_item.get("id") or "").lower()
+                    m_name = str(m_item.get("name") or "").lower()
+                    m_badge = str(m_item.get("badge") or "").lower()
+                    return "free" in m_id or ":free" in m_id or "free" in m_name or "free" in m_badge
+
+                res.sort(key=lambda m: (0 if _is_free_item(m) else 1, str(m.get("id") or m.get("name") or "")))
+                return res
+
+    except Exception:
+        pass
+
+    # The provider did not answer - no key, a 403, a timeout, or it simply does
+    # not publish a list. The catalogue still does, so the card gets a real list
+    # marked as catalogue-derived rather than an empty one that looks like the
+    # account has nothing.
+    return catalog_models(provider_id)
+
+
+class StreamResult(tuple):
+    """2-tuple of (content, thinking) that also carries usage metadata as .usage."""
+    def __new__(cls, content: str, thinking: str, usage: Optional[Dict[str, Any]] = None):
+        obj = super().__new__(cls, (content, thinking))
+        obj.content = content
+        obj.thinking = thinking
+        obj.usage = usage or {}
+        return obj
+
+
+def apply_prompt_cache_hints(
+    provider_id: str,
+    base_url: str,
+    payload: Dict[str, Any],
+    is_local_http: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Attach prefix-caching hints for local llama.cpp servers and cloud APIs."""
+    local = is_local_http
+    if local is None:
+        local = provider_id == "localllmapi" or str(base_url or "").startswith(
+            ("http://127.0.0.1", "http://localhost", "http://192.168.", "http://10.", "http://172.")
+        )
+    if local:
+        payload.setdefault("cache_prompt", True)
+    elif provider_id == "anthropic":
+        msgs = payload.get("messages")
+        if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
+            content = msgs[0].get("content")
+            if isinstance(content, str) and content.strip():
+                msgs[0] = {
+                    "role": "system",
+                    "content": [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}],
+                }
+    return payload
+
+
+_THINK_TAG_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("<think>", "</think>"),
+    ("<thought>", "</thought>"),
+    ("<|channel>thought", "<channel|>"),
+    ("<|channel|>thought", "<|channel|>"),
+)
+
+
+class _InlineThinkingParser:
+    """Streaming parser that splits inline reasoning tags from normal content.
+
+    Handles `<think>...</think>`, `<thought>...</thought>`, and Gemma 4's
+    `<|channel>thought ... <channel|>` across arbitrary SSE chunk boundaries,
+    and drops empty/whitespace-only thinking blocks.
+    """
+
+    def __init__(self) -> None:
+        self._buf: str = ""
+        self._active_close: Optional[str] = None
+        self._has_emitted_thought: bool = False
+
+    @staticmethod
+    def _trailing_prefix_len(text: str, candidates: Tuple[str, ...]) -> int:
+        best = 0
+        for tag in candidates:
+            max_k = min(len(text), len(tag) - 1)
+            for k in range(max_k, best, -1):
+                if text.endswith(tag[:k]):
+                    best = k
+                    break
+        return best
+
+    def feed(self, chunk: str) -> Tuple[List[str], List[str]]:
+        content_parts: List[str] = []
+        thinking_parts: List[str] = []
+        if not chunk:
+            return content_parts, thinking_parts
+        self._buf += chunk
+        open_tags = tuple(pair[0] for pair in _THINK_TAG_PAIRS)
+
+        while self._buf:
+            if self._active_close is None:
+                best_idx = -1
+                best_pair: Optional[Tuple[str, str]] = None
+                for pair in _THINK_TAG_PAIRS:
+                    idx = self._buf.find(pair[0])
+                    if idx != -1 and (best_idx == -1 or idx < best_idx):
+                        best_idx = idx
+                        best_pair = pair
+                if best_pair is not None:
+                    if best_idx > 0:
+                        content_parts.append(self._buf[:best_idx])
+                    self._buf = self._buf[best_idx + len(best_pair[0]):]
+                    self._active_close = best_pair[1]
+                    self._has_emitted_thought = False
+                    continue
+
+                hold = self._trailing_prefix_len(self._buf, open_tags)
+                emit_len = len(self._buf) - hold
+                if emit_len > 0:
+                    content_parts.append(self._buf[:emit_len])
+                    self._buf = self._buf[emit_len:]
+                break
+
+            close_tag = self._active_close
+            idx = self._buf.find(close_tag)
+            if idx != -1:
+                t_piece = self._buf[:idx]
+                if not self._has_emitted_thought:
+                    t_piece = t_piece.lstrip()
+                if t_piece:
+                    thinking_parts.append(t_piece)
+                    self._has_emitted_thought = True
+                self._buf = self._buf[idx + len(close_tag):]
+                self._active_close = None
+                self._has_emitted_thought = False
+                continue
+
+            hold = self._trailing_prefix_len(self._buf, (close_tag,))
+            emit_len = len(self._buf) - hold
+            if emit_len > 0:
+                t_piece = self._buf[:emit_len]
+                if not self._has_emitted_thought:
+                    t_piece = t_piece.lstrip()
+                if t_piece:
+                    thinking_parts.append(t_piece)
+                    self._has_emitted_thought = True
+                self._buf = self._buf[emit_len:]
+            break
+
+        return content_parts, thinking_parts
+
+    def flush(self) -> Tuple[List[str], List[str]]:
+        content_parts: List[str] = []
+        thinking_parts: List[str] = []
+        if not self._buf:
+            return content_parts, thinking_parts
+        if self._active_close is None:
+            content_parts.append(self._buf)
+        else:
+            t_piece = self._buf if self._has_emitted_thought else self._buf.lstrip()
+            if t_piece:
+                thinking_parts.append(t_piece)
+                self._has_emitted_thought = True
+        self._buf = ""
+        return content_parts, thinking_parts
+
+
+def stream_chat_completion(
+    provider_id: str,
+    model_id: str,
+    messages: List[Dict[str, str]],
+    api_key: str = "",
+    generation_params: Optional[Dict[str, Any]] = None,
+    on_token: Optional[Callable[[str], None]] = None,
+    on_thinking: Optional[Callable[[str], None]] = None,
+    is_aborted: Optional[Callable[[], bool]] = None,
+    on_tool: Optional[Callable[[str, str, str], None]] = None,
+    on_usage: Optional[Callable[[Dict[str, Any]], None]] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, str]:
+    """One turn against one provider.
+
+    `on_tool(name, phase, detail)` is how a provider that *executes its own
+    tools* reports them. `phase` is one of:
+
+        ``"running"``  the provider is running the tool; `detail` is the
+                       target - a path, a command, whatever it is acting on
+        ``"done"``     it finished; `detail` is a short result summary
+        ``"failed"``   it did not finish; `detail` is the error
+
+    Optional, and every provider but a plugin-supplied one leaves it None: the
+    shipped providers ask the model for a `<tool:name>` tag in its text and this
+    app executes that itself, so there is nothing to report. It exists for a
+    provider that runs tools server-side, where the tool call happens without
+    the text ever naming it.
+    """
+    params = generation_params or {}
+    cap = get_model_capability(model_id, provider_id=provider_id, api_key=api_key)
+    # Normalised at the only place it is read, so a level can arrive from a
+    # config file, a plugin or a legacy caller in any spelling and behave the
+    # same. Three cases, kept apart on purpose:
+    #   * nothing given -> whatever detection said this model defaults to
+    #   * given as off    -> reasoning stays off, in any spelling
+    #   * given as a level-> that level
+    raw_level = params.get("reasoning_level")
+    level = normalize_level(raw_level) if raw_level not in (None, "") else ""
+    if not level:
+        level = normalize_level(cap.default_level) or "medium"
+    reasoning_level = level
+
+    if provider_id == "opencode_zen":
+        provider_id = "opencode"
+    if provider_id in ("opencode_local", "local_opencode"):
+        provider_id = "local_gguf"
+    info = PROVIDERS_CATALOG.get(provider_id)
+    if not info:
+        return f"Unknown provider: {provider_id}", ""
+
+    if info.needs_custom_auth:
+        err_msg = (f"{info.name} needs special authentication, plain API key is not enough.\n"
+                   f"{info.auth_hint or 'See provider docs for setup.'}")
+        if on_token:
+            on_token(err_msg)
+        return err_msg, ""
+
+    full_text = []
+    full_thinking = []
+    think_parser = _InlineThinkingParser()
+    accumulated_tool_calls: Dict[int, Dict[str, str]] = {}
+    # Detection by doing, not by guessing from the name. A model that streams
+    # a reasoning channel has just proved it reasons, which is the one fact no
+    # heuristic can supply - and it repairs a cached "no reasoning" verdict.
+    observed_reasoning = [False]
+
+    def _mark_reasoning_observed() -> None:
+        if observed_reasoning[0]:
+            return
+        observed_reasoning[0] = True
+        try:
+            note_reasoning_observed(model_id, provider_id)
+        except Exception:
+            pass
+
+    if requests is None:
+        err_msg = "Error: Python 'requests' package is not installed. Run: pip install requests"
+        if on_token:
+            on_token(err_msg)
+        return err_msg, ""
+
+    base_url = resolve_provider_base_url(provider_id, info.base_url)
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "CMDAI/1.0",
+    }
+    if provider_id in ("opencode", "opencode_zen"):
+        session_uid = str(uuid.uuid4())
+        headers["User-Agent"] = "opencode/1.1.28"
+        headers["x-opencode-session"] = session_uid
+        headers["x-opencode-request"] = str(uuid.uuid4())
+        headers["x-opencode-project"] = "default"
+
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["x-api-key"] = api_key
+
+    clean_messages = []
+    for m in messages:
+        if isinstance(m, dict):
+            cm = {"role": m.get("role", "user"), "content": m.get("content", "")}
+            if "name" in m:
+                cm["name"] = m["name"]
+            clean_messages.append(cm)
+        else:
+            clean_messages.append(m)
+
+    payload: Dict[str, Any] = {
+        "model": model_id,
+        "messages": clean_messages,
+        "temperature": params.get("temperature", 0.3),
+        "stream": True,
+    }
+    if tools and provider_id not in ("local_gguf",):
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto" 
+    # Request token usage statistics in stream chunks (supported by OpenAI, OpenRouter, Groq, Ollama, DeepSeek, etc.)
+    if provider_id not in ("anthropic",):
+        payload["stream_options"] = {"include_usage": True}
+
+    mt = params.get("max_tokens", 0)
+    if mt and int(mt) > 0:
+        payload["max_tokens"] = int(mt)
+
+    level = normalize_level(reasoning_level)
+    if cap.thinking and level and level != THINKING_OFF:
+        # A local model answers to its own window; everything else to the fixed
+        # ladder. Both come through one call so no call site can pick the wrong
+        # scale for the provider it happens to be serving.
+        budget = budget_for(provider_id, level, cap.context_limit)
+
+        # The budget the user picked is only ever larger than the output we
+        # asked for if we let it be. `max` is 128k, and a 4k response cannot
+        # spend 128k of thinking - the provider rejects the pair rather than
+        # silently truncating, so the request has to fit.
+        if mt and int(mt) > 0:
+            budget = min(budget, max(1024, int(int(mt) * 0.8)))
+
+        if cap.param_style == "reasoning_effort":
+            # `extra` and `max` are our vocabulary, not the API's: it tops out at
+            # `high`, and sending them through is a 400.
+            payload["reasoning_effort"] = clamp_effort(level)
+            # The name alone would throw the number away. Where the provider has
+            # a field for a budget, send it, so the level means what the bar says
+            # it means. Everywhere else it stays ours, and the UI admits it.
+            field = effort_budget_field(provider_id)
+            if field == "__nested_reasoning__":
+                payload["reasoning"] = {"effort": clamp_effort(level),
+                                        "max_tokens": budget}
+            elif field:
+                payload[field] = budget
+        elif cap.param_style == "budget_tokens":
+            # A numeric ladder, so the top rungs are real here.
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        elif cap.param_style == "chat_template_kwargs":
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": True,
+                "thinking_budget": budget,
+            }
+        # `param_style == "stream_only"` falls through on purpose: the model
+        # reasons on its own and there is no parameter to configure.
+
+    captured_usage: Dict[str, Any] = {}
+    try:
+        from .resource_limits import record_live_context_limit
+
+        def _capture_ctx_headers(r) -> None:
+            try:
+                raw_hdr = r.headers.get("X-LocalLLM-Max-Context")
+                if raw_hdr and str(raw_hdr).strip().isdigit():
+                    hdr_max = int(str(raw_hdr).strip())
+                    if hdr_max > 0:
+                        captured_usage["max_context_tokens"] = hdr_max
+                        record_live_context_limit(provider_id, model_id, hdr_max)
+                raw_act = r.headers.get("X-LocalLLM-Active-Context")
+                if raw_act and str(raw_act).strip().isdigit():
+                    captured_usage["active_n_ctx"] = int(str(raw_act).strip())
+            except Exception:
+                pass
+
+        is_local_http = provider_id == "localllmapi" or base_url.startswith(
+            ("http://127.0.0.1", "http://localhost", "http://192.168.", "http://10.", "http://172.")
+        )
+        apply_prompt_cache_hints(provider_id, base_url, payload, is_local_http=is_local_http)
+        req_timeout = (10.0, 600.0) if is_local_http else (15.0, 300.0)
+
+        def _post_with_slot_retry():
+            r = requests.post(url, headers=headers, json=payload, stream=True, timeout=req_timeout)
+            attempts = 0
+            while attempts < 90:
+                if r.status_code not in (503, 429) and "all slots are busy" not in (getattr(r, "text", "") or "").lower():
+                    break
+                if is_aborted and is_aborted():
+                    break
+                attempts += 1
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                time.sleep(2.0)
+                if is_aborted and is_aborted():
+                    break
+                r = requests.post(url, headers=headers, json=payload, stream=True, timeout=req_timeout)
+            return r
+
+        resp = _post_with_slot_retry()
+        _capture_ctx_headers(resp)
+        is_ctx_err = resp.status_code == 400 and "context_length_exceeded" in (resp.text or "")
+        if not is_ctx_err and (
+            resp.status_code in (400, 422) or (provider_id == "localllmapi" and resp.status_code == 500)
+        ) and any(
+            k in payload for k in ("stream_options", "thinking", "reasoning_effort", "reasoning", "chat_template_kwargs", "tools", "tool_choice")
+        ):
+            # Some endpoints (or GGUF templates in llama-cpp) reject stream_options,
+            # custom reasoning fields, or OpenAI tools; retry cleanly without them.
+            payload.pop("stream_options", None)
+            payload.pop("thinking", None)
+            payload.pop("reasoning_effort", None)
+            payload.pop("reasoning", None)
+            payload.pop("chat_template_kwargs", None)
+            payload.pop("cache_prompt", None)
+            if provider_id == "localllmapi" or (resp.status_code in (400, 422) and "tool" in (resp.text or "").lower()):
+                payload.pop("tools", None)
+                payload.pop("tool_choice", None)
+            resp = _post_with_slot_retry()
+            _capture_ctx_headers(resp)
+        if resp.status_code != 200:
+            err_text = resp.text
+            clean_err = ""
+            try:
+                err_json = resp.json()
+                if isinstance(err_json, dict):
+                    err_obj = err_json.get("error")
+                    if isinstance(err_obj, dict):
+                        clean_err = err_obj.get("message") or str(err_obj)
+                        err_max_ctx = err_obj.get("max_context_tokens")
+                        if isinstance(err_max_ctx, (int, float)) and int(err_max_ctx) > 0:
+                            captured_usage["max_context_tokens"] = int(err_max_ctx)
+                            record_live_context_limit(provider_id, model_id, int(err_max_ctx))
+                    elif isinstance(err_obj, str):
+                        clean_err = err_obj
+                    elif "message" in err_json:
+                        clean_err = err_json["message"]
+            except Exception:
+                clean_err = err_text
+
+            err_msg = f"⚠ API Error [{resp.status_code}]: {clean_err or err_text}"
+
+            if on_token:
+                on_token(err_msg)
+            return err_msg, ""
+
+        for line in resp.iter_lines():
+            if is_aborted and is_aborted():
+                break
+            if not line:
+                continue
+            try:
+                line_str = line.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            if not line_str.startswith("data: "):
+                continue
+            data_str = line_str[6:].strip()
+            if data_str == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(data_str)
+
+                if isinstance(chunk, dict) and chunk.get("error"):
+                    err_obj = chunk["error"]
+                    err_detail = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+                    err_msg = f"Provider error: {err_detail}"
+                    if on_token:
+                        on_token(err_msg)
+                    return err_msg, "".join(full_thinking)
+
+                # 1. Capture usage metadata if provided by endpoint (OpenAI, OpenRouter, Groq, Ollama, LocalLLMAPI, etc.)
+                raw_usage = chunk.get("usage") or chunk.get("x_groq", {}).get("usage")
+                if not raw_usage and ("prompt_eval_count" in chunk or "eval_count" in chunk):
+                    raw_usage = {
+                        "prompt_tokens": chunk.get("prompt_eval_count", 0),
+                        "completion_tokens": chunk.get("eval_count", 0),
+                        "total_tokens": (chunk.get("prompt_eval_count", 0) or 0) + (chunk.get("eval_count", 0) or 0),
+                    }
+                if not raw_usage:
+                    msg_obj = chunk.get("message") or {}
+                    if isinstance(msg_obj, dict) and "usage" in msg_obj:
+                        raw_usage = msg_obj["usage"]
+                    elif chunk.get("type") == "message_delta" and "usage" in chunk:
+                        raw_usage = chunk["usage"]
+
+                if raw_usage and isinstance(raw_usage, dict):
+                    p_tok = raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens")
+                    c_tok = raw_usage.get("completion_tokens") or raw_usage.get("output_tokens")
+                    t_tok = raw_usage.get("total_tokens")
+                    m_tok = raw_usage.get("max_context_tokens")
+                    if p_tok is not None:
+                        captured_usage["prompt_tokens"] = int(p_tok)
+                    if c_tok is not None:
+                        captured_usage["completion_tokens"] = int(c_tok)
+                    if t_tok is not None:
+                        captured_usage["total_tokens"] = int(t_tok)
+                    elif p_tok is not None and c_tok is not None:
+                        captured_usage["total_tokens"] = int(p_tok) + int(c_tok)
+                    if isinstance(m_tok, (int, float)) and int(m_tok) > 0:
+                        captured_usage["max_context_tokens"] = int(m_tok)
+                        record_live_context_limit(provider_id, model_id, int(m_tok))
+                    if isinstance(raw_usage.get("active_n_ctx"), (int, float)):
+                        captured_usage["active_n_ctx"] = int(raw_usage["active_n_ctx"])
+
+                delta = {}
+                choices = chunk.get("choices")
+                if choices and isinstance(choices, list) and len(choices) > 0:
+                    first_choice = choices[0]
+                    if isinstance(first_choice, dict):
+                        delta = first_choice.get("delta") or {}
+                        if not delta and "text" in first_choice:
+                            delta = {"content": first_choice.get("text", "")}
+                elif "delta" in chunk and isinstance(chunk["delta"], dict):
+                    delta = chunk["delta"]
+                elif "message" in chunk and isinstance(chunk["message"], dict):
+                    delta = chunk["message"]
+                elif "response" in chunk and isinstance(chunk["response"], str):
+                    delta = {"content": chunk["response"]}
+                elif not raw_usage:
+                    continue
+
+                reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking") or ""
+                if reasoning_delta:
+                    _mark_reasoning_observed()
+                    full_thinking.append(reasoning_delta)
+                    if on_thinking:
+                        on_thinking(reasoning_delta)
+                    continue
+
+                content_delta = delta.get("content", "") or delta.get("text", "") or ""
+                if not content_delta:
+                    continue
+
+                c_parts, t_parts = think_parser.feed(content_delta)
+                for tp in t_parts:
+                    _mark_reasoning_observed()
+                    full_thinking.append(tp)
+                    if on_thinking:
+                        on_thinking(tp)
+                for cp in c_parts:
+                    full_text.append(cp)
+                    if on_token:
+                        on_token(cp)
+                if c_parts and is_stream_tool_or_turn_complete("".join(full_text)):
+                    break
+
+            except Exception:
+                continue
+
+        c_tail, t_tail = think_parser.flush()
+        for tp in t_tail:
+            _mark_reasoning_observed()
+            full_thinking.append(tp)
+            if on_thinking:
+                on_thinking(tp)
+        for cp in c_tail:
+            full_text.append(cp)
+            if on_token:
+                on_token(cp)
+
+        # If API did not return usage, perform accurate fallback estimation
+        if not captured_usage or not captured_usage.get("completion_tokens"):
+            from .resource_limits import estimate_token_count
+            p_tok = captured_usage.get("prompt_tokens") or estimate_token_count(messages)
+            full_out = "".join(full_text) + "".join(full_thinking)
+            c_tok = estimate_token_count([{"content": full_out}])
+            captured_usage["prompt_tokens"] = p_tok
+            captured_usage["completion_tokens"] = c_tok
+            captured_usage["total_tokens"] = p_tok + c_tok
+            captured_usage["estimated"] = True
+
+        if on_usage:
+            try:
+                on_usage(captured_usage)
+            except Exception:
+                pass
+
+    except Exception as e:
+        err_msg = f"Connection error: {e}"
+        if on_token:
+            on_token(err_msg)
+        return StreamResult(err_msg, "".join(full_thinking), captured_usage)
+
+    return StreamResult("".join(full_text), "".join(full_thinking), captured_usage)
+
+
+def load_custom_providers() -> None:
+    try:
+        from .settings import get_settings
+        settings = get_settings()
+        custom_provs = settings.get_custom_providers()
+        for pid, pdata in custom_provs.items():
+            if not isinstance(pdata, dict):
+                continue
+            name = pdata.get("name") or pid
+            base_url = pdata.get("base_url") or ""
+            models = pdata.get("default_models") or []
+            PROVIDERS_CATALOG[pid] = ProviderInfo(
+                id=pid,
+                name=name,
+                base_url=base_url,
+                key_url="",
+                provider_type="cloud",
+                default_models=list(models),
+                supports_remote_fetch=True,
+                models_endpoint="/models",
+            )
+    except Exception:
+        pass
+
+
+load_custom_providers()

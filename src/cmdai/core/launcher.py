@@ -1,0 +1,153 @@
+import ctypes
+import os
+from typing import Dict
+
+try:
+    import winreg
+except Exception:
+    winreg = None
+
+LAUNCHER_DIR_NAME = "CMDAI"
+FIXED_ROOT_NAME = "CMDAI"
+HWND_BROADCAST = 0xFFFF
+WM_SETTINGCHANGE = 0x001A
+SMTO_ABORTIFHUNG = 0x0002
+
+
+def get_fixed_root() -> str:
+    return os.path.join(os.path.expanduser("~"), FIXED_ROOT_NAME)
+
+
+def build_launcher_scripts(project_root: str) -> Dict[str, str]:
+    """Build Windows launcher script contents for CMDAI.
+
+    Resolution order: $CMDAI_ROOT, then the install-time project_root,
+    then %USERPROFILE%\\CMDAI.
+    """
+    main_cmd = (
+        "@echo off\n"
+        "rem CMDAI global launcher (generated). Regen via: cmdai --install-launcher\n"
+        f'if not defined CMDAI_ROOT set "CMDAI_ROOT={project_root}"\n'
+        'if not exist "%CMDAI_ROOT%\\cmdai.py" set "CMDAI_ROOT=%USERPROFILE%\\CMDAI"\n'
+        'if not exist "%CMDAI_ROOT%\\cmdai.py" (\n'
+        "    echo [ERROR] CMDAI installation not found. Set CMDAI_ROOT or reinstall.\n"
+        "    exit /b 1\n"
+        ")\n"
+        'if exist "%CMDAI_ROOT%\\.venv\\Scripts\\python.exe" (\n'
+        '    set "PYTHON_BIN=%CMDAI_ROOT%\\.venv\\Scripts\\python.exe"\n'
+        ") else (\n"
+        '    set "PYTHON_BIN=python"\n'
+        ")\n"
+        'set "USER_WORKDIR=%CD%"\n'
+        'if "%USER_WORKDIR:~-1%"=="\\" set "USER_WORKDIR=%USER_WORKDIR:~0,-1%"\n'
+        '"%PYTHON_BIN%" "%CMDAI_ROOT%\\cmdai.py" --workdir "%USER_WORKDIR%" %*\n'
+        "exit /b %ERRORLEVEL%\n"
+    )
+    editor_shim = '@echo off\ncall "%~dp0cmdai.cmd" editor %*\n'
+    return {
+        "cmdai.cmd": main_cmd,
+        "editor.cmd": editor_shim,
+    }
+
+
+def _notify_windows_environment_change() -> None:
+    if os.name != "nt":
+        return
+    try:
+        result = ctypes.c_ulong()
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            "Environment",
+            SMTO_ABORTIFHUNG,
+            5000,
+            ctypes.byref(result),
+        )
+    except Exception:
+        pass
+
+
+def _ensure_windows_user_path_contains(path_entry: str) -> bool:
+    if os.name != "nt" or not winreg or not path_entry:
+        return False
+
+    try:
+        env_key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Environment",
+            0,
+            winreg.KEY_READ | winreg.KEY_SET_VALUE,
+        )
+    except Exception:
+        return False
+
+    try:
+        current_path, value_type = winreg.QueryValueEx(env_key, "Path")
+    except FileNotFoundError:
+        current_path, value_type = "", winreg.REG_EXPAND_SZ
+    except Exception:
+        winreg.CloseKey(env_key)
+        return False
+
+    try:
+        parts = [p.strip() for p in str(current_path).split(";") if p.strip()]
+        lowered = {p.lower() for p in parts}
+        if path_entry.lower() in lowered:
+            _notify_windows_environment_change()
+            return True
+
+        new_parts = parts + [path_entry]
+        new_path = ";".join(new_parts)
+        winreg.SetValueEx(env_key, "Path", 0, value_type, new_path)
+
+        process_parts = [
+            p.strip() for p in os.environ.get("PATH", "").split(";") if p.strip()
+        ]
+        process_lower = {p.lower() for p in process_parts}
+        if path_entry.lower() not in process_lower:
+            process_parts.append(path_entry)
+            os.environ["PATH"] = ";".join(process_parts)
+
+        _notify_windows_environment_change()
+        return True
+    except Exception:
+        return False
+    finally:
+        winreg.CloseKey(env_key)
+
+
+def install_global_launcher(silent: bool = False) -> bool:
+    if os.name != "nt":
+        if not silent:
+            print("Launcher install is currently available on Windows only.")
+        return False
+
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+        launcher_dir = os.path.join(os.path.expanduser("~"), LAUNCHER_DIR_NAME)
+        os.makedirs(launcher_dir, exist_ok=True)
+
+        scripts = build_launcher_scripts(project_root)
+        installed = []
+        for name, content in scripts.items():
+            script_path = os.path.join(launcher_dir, name)
+            with open(script_path, "w", encoding="utf-8", newline="\r\n") as f:
+                f.write(content)
+            installed.append(script_path)
+
+        path_ok = _ensure_windows_user_path_contains(launcher_dir)
+
+        if not silent:
+            for p in installed:
+                print(f"Launcher installed: {p}")
+            if path_ok:
+                print("Global command registered! Open a NEW terminal and run: cmdai")
+            else:
+                print(f"Add this folder to PATH manually: {launcher_dir}")
+        return True
+    except Exception as e:
+        if not silent:
+            print(f"Launcher install failed: {e}")
+        return False

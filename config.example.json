@@ -1,0 +1,55 @@
+{
+  "version": "1.0.0",
+  "app_name": "CMDAI",
+  "models_dir": "models",
+  "default_model": "",
+  "default_provider": "local_gguf",
+  "cmdai_code_path": "E:\\CMDAI CODE\\cmdai.py",
+  "server": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 11434
+  },
+  "inference": {
+    "temperature": 0.6,
+    "max_tokens": 4096,
+    "n_ctx": 8192,
+    "n_gpu_layers": -1
+  },
+  "agent": {
+    "mode": "auto",
+    "max_steps": 30
+  },
+  "permissions": {
+    "read": "allow",
+    "ls": "allow",
+    "glob": "allow",
+    "search": "allow",
+    "web": "allow",
+    "ask": "allow",
+    "todo": "allow",
+    "memory": "allow",
+    "models": "allow",
+    "cmdai_code": "allow",
+    "system": {
+      "sysinfo": "allow",
+      "processes": "allow",
+      "clipboard_get": "allow",
+      "clipboard_set": "allow",
+      "notify": "allow",
+      "open_app": "allow",
+      "open_url": "allow",
+      "volume": "allow",
+      "kill_process": "ask",
+      "*": "ask"
+    },
+    "write": "ask",
+    "edit": "ask",
+    "command": {
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "*": "ask"
+    }
+  }
+}

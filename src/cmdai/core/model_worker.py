@@ -1,0 +1,507 @@
+import os
+import sys
+import json
+import time
+import re
+import ctypes
+import queue
+import threading
+from typing import Any, Dict, List, Optional
+
+TOOL_COMPLETE_PATTERNS = re.compile(
+    r'(?:'
+    r'<tool:\w+[^>]*?/>'
+    r'|</tool:\w+>'
+    r'|<tool_call>[^>]*?/>'
+    r'|</tool_call>'
+    r'|<\|tool_call>[^>]*?/>'
+    r'|<tool:(?:ls|read|glob|search|code_search|bugs)[^>]*?>'
+    r')',
+    re.IGNORECASE
+)
+
+try:
+    import llama_cpp
+    from llama_cpp import Llama, llama_log_set
+    def _null_log(level, text, user_data):
+        pass
+    _C_LOG = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)(_null_log)
+    try:
+        llama_log_set(_C_LOG, None)
+    except Exception:
+        pass
+except Exception:
+    llama_cpp = None
+    Llama = None
+
+
+def _gpu_offload_supported() -> Optional[bool]:
+    if not llama_cpp:
+        return None
+    for owner in (llama_cpp, getattr(llama_cpp, "llama_cpp", None)):
+        fn = getattr(owner, "llama_supports_gpu_offload", None)
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                pass
+    return None
+
+
+def find_matching_mmproj(model_path: str) -> Optional[str]:
+    """Find a matching mmproj*.gguf file in the same directory as `model_path`."""
+    if not model_path or not os.path.isfile(model_path):
+        return None
+    model_dir = os.path.dirname(model_path)
+    model_low = os.path.basename(model_path).lower()
+    candidates = [
+        f for f in sorted(os.listdir(model_dir))
+        if f.lower().endswith(".gguf") and "mmproj" in f.lower()
+    ]
+    if not candidates:
+        return None
+    # Score candidates by shared family / model tokens (e.g. gemma-4, qwen2-vl, llava)
+    model_tokens = [t for t in model_low.replace(".gguf", "").replace("_", "-").split("-") if len(t) >= 2 and not t.startswith(("q4", "q5", "q6", "q8", "f16", "iq"))]
+    best = None
+    best_score = -1
+    for c in candidates:
+        clow = c.lower().replace("_", "-")
+        score = sum(1 for t in model_tokens if t in clow)
+        if score > best_score:
+            best_score = score
+            best = c
+    if best and best_score > 0:
+        return os.path.join(model_dir, best)
+    # If there's only one mmproj in the dir and model itself looks multimodal, allow it only if token matched
+    return None
+
+
+def _create_vision_chat_handler(model_path: str, mmproj_path: str) -> Any:
+    """Instantiate the appropriate llama-cpp-python vision chat handler."""
+    import llama_cpp.llama_chat_format as lcf  # type: ignore
+
+    low = os.path.basename(model_path).lower()
+    cls_names: List[str] = []
+    if "gemma-4" in low or "gemma4" in low:
+        cls_names.append("Gemma4ChatHandler")
+    elif "qwen2.5-vl" in low or "qwen2_5-vl" in low or "qwen2-vl" in low or "qwen2vl" in low or "qwen3-vl" in low:
+        cls_names.append("Qwen25VLChatHandler")
+    elif "minicpm" in low:
+        cls_names.append("MiniCPMv26ChatHandler")
+    elif "moondream" in low:
+        cls_names.append("MoondreamChatHandler")
+    elif "llava-1.6" in low or "llava-v1.6" in low:
+        cls_names.append("Llava16ChatHandler")
+    cls_names.extend(["MTMDChatHandler", "Llava15ChatHandler"])
+
+    for name in cls_names:
+        cls = getattr(lcf, name, None)
+        if cls is not None:
+            try:
+                return cls(clip_model_path=mmproj_path, verbose=False)
+            except Exception:
+                continue
+    return None
+
+
+class ModelWorker:
+    def __init__(self):
+        self.llm = None
+        self.current_model_path = None
+        self.current_model_id = None
+        self.current_loader = None
+        self.requested_loader = None
+        self.current_n_ctx = 0
+        self.current_mmproj = ""
+        self.abort_requested = False
+        self.msg_queue = queue.Queue()
+        self._listener_thread = None
+
+    def find_model_path(self, model_filename: str) -> Optional[str]:
+        try:
+            from .model_paths import resolve_model_file
+        except (ImportError, ValueError):
+            try:
+                from cmdai.core.model_paths import resolve_model_file
+            except ImportError:
+                _cur = os.path.dirname(os.path.abspath(__file__))
+                if _cur not in sys.path:
+                    sys.path.insert(0, _cur)
+                from model_paths import resolve_model_file
+        return resolve_model_file(model_filename) or None
+
+    def load(self, model_filename: str, loader_type: str = "cpu", n_ctx: int = 2048, use_mmproj: bool = False) -> Dict[str, Any]:
+        if not Llama:
+            return {"status": "error", "error": "llama_cpp not installed"}
+        path = self.find_model_path(model_filename)
+        if not path:
+            return {"status": "error", "error": f"Model not found: {model_filename}"}
+
+        mmproj_path = (find_matching_mmproj(path) or "") if use_mmproj else ""
+        norm_loader = (loader_type or "cpu").strip().lower()
+        target_ctx = int(n_ctx or 8192)
+        if (
+            self.llm is not None
+            and self.current_model_path == path
+            and self.requested_loader == norm_loader
+            and self.current_mmproj == mmproj_path
+            and (self.current_n_ctx == target_ctx or not self.current_n_ctx)
+        ):
+            return {
+                "status": "ok",
+                "elapsed": 0.0,
+                "cached": True,
+                "n_ctx": self.current_n_ctx or target_ctx,
+                "loader": self.current_loader or norm_loader,
+                "requested_loader": norm_loader,
+                "mmproj": self.current_mmproj,
+            }
+
+        t0 = time.time()
+        gpu_offload = _gpu_offload_supported()
+        warning = ""
+        if norm_loader in ("vulkan", "cuda"):
+            if gpu_offload is False:
+                n_gpu = 0
+                effective_loader = "cpu"
+                warning = f"{norm_loader.upper()} requested, but installed llama-cpp-python has no GPU offload support; running on CPU."
+            else:
+                n_gpu = -1
+                effective_loader = norm_loader
+        elif norm_loader == "cpu":
+            n_gpu = 0
+            effective_loader = "cpu"
+        else:
+            n_gpu = 0
+            effective_loader = "cpu"
+            warning = f"Loader '{norm_loader}' is not supported by llama-cpp-python; using CPU."
+
+        chat_handler = _create_vision_chat_handler(path, mmproj_path) if mmproj_path else None
+
+        def _create_llama(ctx_len: int, gpu_layers: int):
+            kwargs: Dict[str, Any] = {
+                "model_path": path,
+                "n_ctx": ctx_len,
+                "n_gpu_layers": gpu_layers,
+                "flash_attn": True,
+                "verbose": False,
+            }
+            if chat_handler is not None:
+                kwargs["chat_handler"] = chat_handler
+            try:
+                return Llama(**kwargs), ctx_len
+            except Exception:
+                if ctx_len > 8192:
+                    kwargs["n_ctx"] = 8192
+                    return Llama(**kwargs), 8192
+                raise
+
+        try:
+            if self.llm is not None:
+                del self.llm
+                self.llm = None
+
+            self.llm, actual_ctx = _create_llama(target_ctx, n_gpu)
+            self.current_model_path = path
+            self.current_model_id = model_filename
+            self.current_loader = effective_loader
+            self.requested_loader = norm_loader
+            self.current_n_ctx = actual_ctx
+            self.current_mmproj = mmproj_path if chat_handler is not None else ""
+            elapsed = time.time() - t0
+            return {
+                "status": "ok",
+                "elapsed": elapsed,
+                "n_ctx": actual_ctx,
+                "loader": effective_loader,
+                "requested_loader": norm_loader,
+                "n_gpu_layers": n_gpu,
+                "gpu_offload": gpu_offload,
+                "mmproj": self.current_mmproj,
+                "warning": warning,
+            }
+        except Exception as e:
+            if n_gpu != 0:
+                try:
+                    self.llm, actual_ctx = _create_llama(target_ctx, 0)
+                    self.current_model_path = path
+                    self.current_model_id = model_filename
+                    self.current_loader = "cpu"
+                    self.requested_loader = norm_loader
+                    self.current_n_ctx = actual_ctx
+                    elapsed = time.time() - t0
+                    return {
+                        "status": "ok",
+                        "elapsed": elapsed,
+                        "n_ctx": actual_ctx,
+                        "loader": "cpu",
+                        "requested_loader": norm_loader,
+                        "n_gpu_layers": 0,
+                        "gpu_offload": gpu_offload,
+                        "warning": f"{norm_loader.upper()} initialization failed ({e}); fell back to CPU.",
+                    }
+                except Exception as e2:
+                    return {"status": "error", "error": str(e2)}
+            return {"status": "error", "error": str(e)}
+
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.6, max_tokens: int = 2048):
+        if not self.llm:
+            sys.stdout.write(json.dumps({"type": "error", "error": "Model not loaded"}) + "\n")
+            sys.stdout.flush()
+            return
+
+        self.abort_requested = False
+        full_text = []
+        full_thinking = []
+        is_in_thinking = False
+        t0 = time.time()
+
+        stop_tokens = ["<end_of_turn>", "<|end_of_turn|>", "<eos>", "<|im_end|>", "<|turn_end|>", "</s>"]
+        n_ctx_total = 8192
+        try:
+            if hasattr(self.llm, "n_ctx") and callable(self.llm.n_ctx):
+                n_ctx_total = int(self.llm.n_ctx())
+            elif hasattr(self.llm, "n_ctx"):
+                n_ctx_total = int(self.llm.n_ctx)
+        except Exception:
+            n_ctx_total = 8192
+
+        def _count_tokens(content_val: Any) -> int:
+            if isinstance(content_val, list):
+                toks = 0
+                for part in content_val:
+                    if isinstance(part, dict):
+                        if part.get("type") == "image_url":
+                            toks += 512
+                        else:
+                            toks += _count_tokens(str(part.get("text") or ""))
+                return toks
+            text = str(content_val or "")
+            try:
+                return len(self.llm.tokenize(text.encode("utf-8", errors="replace"), add_bos=False))
+            except Exception:
+                return max(1, len(text.split()) * 4 // 3)
+
+        cleaned_msgs = []
+        for m in messages:
+            role = m.get("role", "user")
+            raw_content = m.get("content", "")
+            if isinstance(raw_content, list):
+                mm_parts = []
+                for part in raw_content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        txt = str(part.get("text") or "")
+                        if len(txt) > 7000:
+                            txt = txt[:3000] + "\n\n[... content truncated to fit context window ...]\n\n" + txt[-3000:]
+                        mm_parts.append({"type": "text", "text": txt})
+                    elif isinstance(part, dict):
+                        mm_parts.append(part)
+                cleaned_msgs.append({"role": role, "content": mm_parts})
+            else:
+                content = str(raw_content or "")
+                if len(content) > 7000:
+                    content = content[:3000] + "\n\n[... content truncated to fit context window ...]\n\n" + content[-3000:]
+                cleaned_msgs.append({"role": role, "content": content})
+
+        mt = 1024 if (not max_tokens or max_tokens <= 0) else int(max_tokens)
+        safe_budget = max(1024, n_ctx_total - mt - 128)
+
+        total_toks = sum(_count_tokens(m["content"]) + 4 for m in cleaned_msgs)
+        if total_toks > safe_budget and len(cleaned_msgs) > 2:
+            pruned = [cleaned_msgs[0]]
+            tail = cleaned_msgs[1:]
+            tail_toks = 0
+            selected = []
+            for m in reversed(tail):
+                m_toks = _count_tokens(m["content"]) + 4
+                if tail_toks + m_toks > (safe_budget - _count_tokens(pruned[0]["content"]) - 64):
+                    if not selected:
+                        selected.append(m)
+                    break
+                selected.append(m)
+                tail_toks += m_toks
+            pruned.extend(reversed(selected))
+            cleaned_msgs = pruned
+            total_toks = sum(_count_tokens(m["content"]) + 4 for m in cleaned_msgs)
+
+        rem_tokens = max(128, n_ctx_total - total_toks - 16)
+        actual_mt = min(mt, rem_tokens)
+
+        def _run_stream(msgs_to_run, mt_to_run):
+            nonlocal is_in_thinking
+            stream = self.llm.create_chat_completion(
+                messages=msgs_to_run,
+                temperature=temperature,
+                max_tokens=mt_to_run,
+                stop=stop_tokens,
+                stream=True,
+            )
+            for chunk in stream:
+                if self.abort_requested:
+                    break
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content", "")
+                if not content:
+                    continue
+
+                think_open = "<think>" if "<think>" in content else ("<thought>" if "<thought>" in content else None)
+                if think_open:
+                    close_tag = "</think>" if think_open == "<think>" else "</thought>"
+                    parts = content.split(think_open, 1)
+                    if parts[0]:
+                        full_text.append(parts[0])
+                        sys.stdout.write(json.dumps({"type": "token", "content": parts[0]}) + "\n")
+                        sys.stdout.flush()
+                    is_in_thinking = True
+                    remainder = parts[1]
+                    if close_tag in remainder:
+                        th_parts = remainder.split(close_tag, 1)
+                        full_thinking.append(th_parts[0])
+                        sys.stdout.write(json.dumps({"type": "thinking", "content": th_parts[0]}) + "\n")
+                        sys.stdout.flush()
+                        is_in_thinking = False
+                        if th_parts[1]:
+                            full_text.append(th_parts[1])
+                            sys.stdout.write(json.dumps({"type": "token", "content": th_parts[1]}) + "\n")
+                            sys.stdout.flush()
+                    else:
+                        full_thinking.append(remainder)
+                        sys.stdout.write(json.dumps({"type": "thinking", "content": remainder}) + "\n")
+                        sys.stdout.flush()
+                    continue
+
+                if is_in_thinking:
+                    close_tag = "</think>" if "</think>" in content else ("</thought>" if "</thought>" in content else None)
+                    if close_tag:
+                        parts = content.split(close_tag, 1)
+                        full_thinking.append(parts[0])
+                        sys.stdout.write(json.dumps({"type": "thinking", "content": parts[0]}) + "\n")
+                        sys.stdout.flush()
+                        is_in_thinking = False
+                        if parts[1]:
+                            full_text.append(parts[1])
+                            sys.stdout.write(json.dumps({"type": "token", "content": parts[1]}) + "\n")
+                            sys.stdout.flush()
+                            if TOOL_COMPLETE_PATTERNS.search("".join(full_text)):
+                                break
+                    else:
+                        full_thinking.append(content)
+                        sys.stdout.write(json.dumps({"type": "thinking", "content": content}) + "\n")
+                        sys.stdout.flush()
+                    continue
+
+                full_text.append(content)
+                sys.stdout.write(json.dumps({"type": "token", "content": content}) + "\n")
+                sys.stdout.flush()
+
+                curr_txt = "".join(full_text)
+                if TOOL_COMPLETE_PATTERNS.search(curr_txt):
+                    break
+
+        try:
+            try:
+                _run_stream(cleaned_msgs, actual_mt)
+            except Exception as first_err:
+                err_str = str(first_err).lower()
+                if "exceed context window" in err_str or "requested tokens" in err_str or "context length" in err_str:
+                    emergency_msgs = [cleaned_msgs[0]]
+                    if len(cleaned_msgs) > 1:
+                        last_c = cleaned_msgs[-1]["content"]
+                        if len(last_c) > 2000:
+                            last_c = last_c[:1000] + "\n\n[... truncated ...]\n\n" + last_c[-1000:]
+                        emergency_msgs.append({"role": cleaned_msgs[-1]["role"], "content": last_c})
+                    _run_stream(emergency_msgs, 512)
+                else:
+                    raise first_err
+
+            elapsed = time.time() - t0
+            p_tok = total_toks
+            c_tok = _count_tokens("".join(full_text) + "".join(full_thinking))
+            sys.stdout.write(json.dumps({
+                "type": "done",
+                "response": "".join(full_text),
+                "thinking": "".join(full_thinking),
+                "elapsed": elapsed,
+                "aborted": self.abort_requested,
+                "usage": {
+                    "prompt_tokens": p_tok,
+                    "completion_tokens": c_tok,
+                    "total_tokens": p_tok + c_tok,
+                },
+            }) + "\n")
+            sys.stdout.flush()
+
+        except Exception as e:
+            sys.stdout.write(json.dumps({"type": "error", "error": str(e)}) + "\n")
+            sys.stdout.flush()
+
+    def _listen_stdin(self):
+        while True:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    self.msg_queue.put(None)
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                if msg.get("action") == "abort":
+                    self.abort_requested = True
+                else:
+                    self.msg_queue.put(msg)
+            except Exception:
+                self.msg_queue.put(None)
+                break
+
+    def run(self):
+        self._listener_thread = threading.Thread(target=self._listen_stdin, daemon=True)
+        self._listener_thread.start()
+
+        while True:
+            msg = self.msg_queue.get()
+            if msg is None:
+                break
+
+            action = msg.get("action")
+            if action == "ping":
+                sys.stdout.write(json.dumps({"status": "pong"}) + "\n")
+                sys.stdout.flush()
+            elif action == "load":
+                res = self.load(
+                    model_filename=msg.get("model", ""),
+                    loader_type=msg.get("loader", "cpu"),
+                    n_ctx=msg.get("n_ctx", 8192),
+                    use_mmproj=bool(msg.get("use_mmproj", False)),
+                )
+                sys.stdout.write(json.dumps(res) + "\n")
+                sys.stdout.flush()
+            elif action == "chat":
+                self.chat(
+                    messages=msg.get("messages", []),
+                    temperature=msg.get("temperature", 0.6),
+                    max_tokens=msg.get("max_tokens", 2048),
+                )
+            elif action == "abort":
+                self.abort_requested = True
+            elif action == "unload":
+                if self.llm:
+                    del self.llm
+                    self.llm = None
+                self.current_model_path = None
+                self.current_model_id = None
+                self.current_loader = None
+                self.requested_loader = None
+                self.current_n_ctx = 0
+                sys.stdout.write(json.dumps({"status": "unloaded"}) + "\n")
+                sys.stdout.flush()
+            elif action == "exit":
+                break
+
+
+if __name__ == "__main__":
+    worker = ModelWorker()
+    worker.run()
