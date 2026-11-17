@@ -143,7 +143,7 @@ class CommandsMixin:
         try:
             chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
             self._turn_counter += 1
-            user_msg = UserMessageCard(prompt, turn_id=self._turn_counter, time_str=now_str)
+            user_msg = UserMessageCard(prompt, turn_id=self._turn_counter, time_str=now_str, timestamp=now_ts)
             chat_scroll.mount(user_msg)
             chat_scroll.scroll_end(animate=False)
         except Exception:
@@ -163,7 +163,7 @@ class CommandsMixin:
                     timeout=4.0,
                 )
 
-        user_entry: Dict[str, Any] = {"role": "user", "content": prompt, "turn_id": self._turn_counter}
+        user_entry: Dict[str, Any] = {"role": "user", "content": prompt, "turn_id": self._turn_counter, "time": now_str, "timestamp": now_ts}
         if pending_imgs:
             user_entry["images"] = pending_imgs
         self.messages.append(user_entry)
@@ -375,10 +375,18 @@ class CommandsMixin:
             "tools_run": 0,
         }
         self._current_assistant_card = None
+        if hasattr(self, "agent_ctx"):
+            self.agent_ctx.todo_list = []
+        try:
+            self._on_todo_updated([])
+        except Exception:
+            pass
         try:
             self.query_one("#chat-scroll", VerticalScroll).remove_children()
         except Exception:
             pass
+        self._active_view_turn_idx = None
+        self._refresh_timeline_rail()
         self._switch_to_hero()
         self._update_terminal_title()
         if hasattr(self, "_open_session_ids"):
@@ -1736,7 +1744,9 @@ class CommandsMixin:
         try:
             chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
             self._turn_counter += 1
-            user_msg = UserMessageCard(f"!{cmd_line}", turn_id=self._turn_counter)
+            now_ts = time.time()
+            now_str = time.strftime("%H:%M", time.localtime(now_ts))
+            user_msg = UserMessageCard(f"!{cmd_line}", turn_id=self._turn_counter, time_str=now_str, timestamp=now_ts)
             chat_scroll.mount(user_msg)
             card = AssistantTurnCard("Terminal", turn_id=self._turn_counter)
             chat_scroll.mount(card)

@@ -1398,24 +1398,6 @@ class AgentRunner:
                         self.on_tool_start("cmdai_code", f"decided: {chosen} ({str(question)[:45]})")
                     return chosen
 
-                def _sync_code_todos(code_todos: List[Any]) -> None:
-                    if not isinstance(code_todos, list) or not code_todos:
-                        return
-                    norm_todos: List[Dict[str, Any]] = []
-                    for item in code_todos:
-                        if isinstance(item, dict):
-                            txt = str(item.get("text", "") or "").strip()
-                            if txt:
-                                norm_todos.append({"text": txt, "done": bool(item.get("done", False))})
-                        else:
-                            txt = str(item or "").strip()
-                            if txt:
-                                norm_todos.append({"text": txt, "done": False})
-                    if norm_todos:
-                        ctx.todo_list = norm_todos
-                        if self.on_todo_updated:
-                            self.on_todo_updated(list(ctx.todo_list))
-
                 r = send_to_cmdai_code(
                     task=task_txt,
                     workdir=target_wd,
@@ -1423,7 +1405,6 @@ class AgentRunner:
                     mode=mode_arg,
                     new_session=new_sess,
                     decision_handler=_cmdai_decision_handler,
-                    todo_handler=_sync_code_todos,
                 )
                 res = {
                     "success": bool(r.get("ok")),

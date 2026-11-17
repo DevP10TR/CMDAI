@@ -133,8 +133,19 @@ def install_global_launcher(silent: bool = False) -> bool:
         installed = []
         for name, content in scripts.items():
             script_path = os.path.join(launcher_dir, name)
+            if os.path.exists(script_path):
+                try:
+                    os.chmod(script_path, 0o666)
+                except Exception:
+                    pass
             with open(script_path, "w", encoding="utf-8", newline="\r\n") as f:
                 f.write(content)
+            if name.lower() == "cmdai.cmd":
+                try:
+                    # Protect CMDAI's global launcher from being overwritten by CMDAI-CODE on startup
+                    os.chmod(script_path, 0o444)
+                except Exception:
+                    pass
             installed.append(script_path)
 
         path_ok = _ensure_windows_user_path_contains(launcher_dir)

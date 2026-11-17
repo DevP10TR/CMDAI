@@ -300,6 +300,8 @@ class SessionsMixin:
                     "kind": "user",
                     "text": str(getattr(child, "prompt", "") or ""),
                     "turn_id": int(getattr(child, "turn_id", 0) or 0),
+                    "time": str(getattr(child, "time_str", "") or ""),
+                    "timestamp": getattr(child, "timestamp", None),
                 })
             elif isinstance(child, AssistantTurnCard):
                 tb = getattr(child, "thinking_block", None)
@@ -887,11 +889,9 @@ class SessionsMixin:
                         t_str = time.strftime("%H:%M", time.localtime(float(item["timestamp"])))
                     except Exception:
                         t_str = ""
-                if not t_str:
-                    t_str = getattr(self, "_current_session_time_str", "") or ""
                 if t_str and not item.get("time"):
                     item["time"] = t_str
-                chat_scroll.mount(UserMessageCard(str(item.get("text", "")), turn_id=turn_id, time_str=t_str))
+                chat_scroll.mount(UserMessageCard(str(item.get("text", "")), turn_id=turn_id, time_str=t_str, timestamp=item.get("timestamp")))
                 continue
 
             if card is None:
@@ -1477,10 +1477,12 @@ class SessionsMixin:
                 logging.exception("Error replaying transcript: %s", ex)
             if data.get("todo_list") and hasattr(self, "agent_ctx"):
                 self.agent_ctx.todo_list = list(data["todo_list"])
-                try:
-                    self._on_todo_updated(list(self.agent_ctx.todo_list))
-                except Exception:
-                    pass
+            elif hasattr(self, "agent_ctx"):
+                self.agent_ctx.todo_list = []
+            try:
+                self._on_todo_updated(list(getattr(self.agent_ctx, "todo_list", []) or []))
+            except Exception:
+                pass
             pend = data.get("pending_approval")
             if pend and isinstance(pend, dict) and not is_active_gen:
                 self._pending_approval_details = pend
@@ -1493,6 +1495,10 @@ class SessionsMixin:
                 except Exception:
                     pass
         else:
+            try:
+                self._on_todo_updated([])
+            except Exception:
+                pass
             self._switch_to_hero()
         self.update_meta_bars()
         self._update_terminal_title()
